@@ -45,8 +45,12 @@ bash -n lib/common.sh
 bash -n update-system.sh
 bash -n local-ai.sh
 python3 -B -m unittest discover -s tests -p 'test_*.py'
-# Optional, if ShellCheck is installed:
-shellcheck -x -P SCRIPTDIR lib/common.sh update-system.sh local-ai.sh
 ```
 
-Tests use temporary files and fake system commands; they do not install updates or change services.
+Tests use temporary files and fake system commands; they do not install updates or change services. Syntax checks print nothing when successful; the test suite ends with `OK`.
+
+Optional lint check, only if ShellCheck is installed (the scripts do not require it):
+
+```bash
+shellcheck -x -P SCRIPTDIR lib/common.sh update-system.sh local-ai.sh
+```
