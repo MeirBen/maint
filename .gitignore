@@ -10,3 +10,6 @@
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Python regression-test cache
+/tests/__pycache__/

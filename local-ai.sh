@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Desktop controls for the local browser chat.
-# Keep one overwritten log: <script-folder>/logs/local-ai.log
-if [[ $# -eq 0 ]]; then
+# Local AI feature: Open WebUI and Ollama service controls.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/lib/common.sh"
+
+choose_action() {
+    local choice
     echo 'Local AI — Open WebUI + Ollama'
     echo
     echo '1) Start and open chat'
@@ -12,96 +16,56 @@ if [[ $# -eq 0 ]]; then
     echo '4) Exit'
     echo
     while true; do
-        read -r -p 'Choose [1-4]: ' choice || exit 0
+        read -r -p 'Choose [1-4]: ' choice || return 1
         case "$choice" in
-            1) set -- start; break ;;
-            2) set -- stop; break ;;
-            3) set -- update; break ;;
-            4) exit 0 ;;
+            1) ACTION=start; return 0 ;;
+            2) ACTION=stop; return 0 ;;
+            3) ACTION=update; return 0 ;;
+            4) return 1 ;;
             *) echo 'Please choose 1, 2, 3, or 4.' ;;
         esac
     done
-fi
-if [[ $# -ne 1 || ( "$1" != start && "$1" != stop && "$1" != update ) ]]; then
-    echo 'Usage: local-ai.sh start|stop|update' >&2
-    exit 2
-fi
-
-ACTION="$1"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="${SCRIPT_DIR}/logs"
-LOG_FILE="${LOG_DIR}/local-ai.log"
-
-# Lock the same log for normal and sudo runs, before overwriting it.
-mkdir -p "$LOG_DIR"
-exec 9>>"$LOG_FILE"
-if ! flock --wait 180 9; then
-    echo 'Another Local AI control is still running. Please try again.' >&2
-    exit 1
-fi
-# A sudo run must leave the log writable by the owner of the scripts folder.
-if (( EUID == 0 )); then
-    chown --reference="$SCRIPT_DIR" -- "$LOG_DIR" "$LOG_FILE"
-fi
-: > "$LOG_FILE"
-
-log() {
-    local level="$1"
-    shift
-    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" | tee -a "$LOG_FILE"
 }
 
-pause_before_exit() {
-    if [[ "${SCRIPT_PAUSE_ON_EXIT:-0}" == 1 && -t 0 ]]; then
-        echo
-        read -r -p 'Press Enter to exit...' || true
-    fi
-}
-
-on_error() {
-    local result=$?
-    trap - ERR
-    log ERROR "Could not ${ACTION} Local AI (exit code ${result})."
-    log ERROR "See the log: ${LOG_FILE}"
-    flock --unlock 9
-    pause_before_exit
-    exit "$result"
-}
-trap on_error ERR
-
-if [[ "$ACTION" == start ]]; then
-    log INFO 'Starting Open WebUI and Ollama…'
-elif [[ "$ACTION" == stop ]]; then
-    log INFO 'Stopping Open WebUI and Ollama. Any active reply will stop.'
-else
-    log INFO 'Checking for stable updates to Ollama, Phi, and Open WebUI…'
-fi
-service_command=(/usr/local/sbin/local-ai-service-control "$ACTION")
-if (( EUID != 0 )); then
-    log INFO 'Checking sudo access...'
-    sudo -v
-    log OK 'Sudo access confirmed.'
-    service_command=(sudo "${service_command[@]}")
-fi
-"${service_command[@]}" 2>&1 | tee -a "$LOG_FILE"
-
-if [[ "$ACTION" == start ]]; then
-    log OK 'Local AI is ready at http://127.0.0.1:8080'
+open_chat() {
+    success 'Local AI is ready at http://127.0.0.1:8080'
     if (( EUID == 0 )); then
-        log INFO 'Open http://127.0.0.1:8080 in your browser.'
+        info 'Open http://127.0.0.1:8080 in your browser.'
     else
-        log INFO 'Opening the browser chat…'
+        info 'Opening the browser chat…'
         # Launch independently of this terminal; keep the browser alive until it exits.
         if ! /usr/bin/systemd-run --user --collect --quiet --service-type=exec \
             --property=ExitType=cgroup \
             --property=StandardOutput=null --property=StandardError=null \
             /usr/bin/xdg-open http://127.0.0.1:8080 >> "$LOG_FILE" 2>&1; then
-            log WARN 'Open http://127.0.0.1:8080 in your browser.'
+            warn_condition 'Open http://127.0.0.1:8080 in your browser.'
         fi
     fi
-elif [[ "$ACTION" == stop ]]; then
-    log OK 'Both services are stopped. Your conversations and downloaded model are saved.'
-fi
-log INFO "Log: ${LOG_FILE}"
-flock --unlock 9
-pause_before_exit
+}
+
+main() {
+    ACTION="${1:-}"
+    if [[ $# -eq 0 ]]; then
+        choose_action || return 0
+    elif [[ $# -ne 1 || ( "$ACTION" != start && "$ACTION" != stop && "$ACTION" != update ) ]]; then
+        echo 'Usage: local-ai start|stop|update' >&2
+        return 2
+    fi
+
+    initialize_runtime "$SCRIPT_DIR" local-ai "Local AI ${ACTION}"
+    case "$ACTION" in
+        start) info 'Starting Open WebUI and Ollama…' ;;
+        stop) info 'Stopping Open WebUI and Ollama. Any active reply will stop.' ;;
+        update) info 'Checking for stable updates to Ollama, Phi, and Open WebUI…' ;;
+    esac
+    require_sudo
+    run_root /usr/local/sbin/local-ai-service-control "$ACTION"
+
+    case "$ACTION" in
+        start) open_chat ;;
+        stop) success 'Both services are stopped. Your conversations and downloaded model are saved.' ;;
+    esac
+    show_completion_summary
+}
+
+main "$@"

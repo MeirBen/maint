@@ -10,150 +10,19 @@ set -Eeuo pipefail
 #   - firmware, autoremove, and NVIDIA branch changes require confirmation
 #   - one overwritten log is kept at <script-folder>/logs/update-system.log
 
-umask 077
-export LC_ALL=C
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="${SCRIPT_DIR}/logs"
-LOG_FILE="${LOG_DIR}/update-system.log"
-TMP_DIR=""
-REBOOT_RECOMMENDED=0
-WARNING_COUNT=0
-START_TIME="$(date +%s)"
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/lib/common.sh"
 
+REBOOT_RECOMMENDED=0
 PHASED_OPTION="APT::Get::Always-Include-Phased-Updates=true"
 MIN_ROOT_FREE_KIB=$((2 * 1024 * 1024)) # 2 GiB
-
-mkdir -p -- "$LOG_DIR"
-: > "$LOG_FILE"
-TMP_DIR="$(mktemp -d "${LOG_DIR}/maintenance.XXXXXX")"
-
-# Terminal colors only. The saved log stays plain text.
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-    COLOR_INFO=$'\033[0;34m'
-    COLOR_OK=$'\033[0;32m'
-    COLOR_WARN=$'\033[1;33m'
-    COLOR_ERROR=$'\033[0;31m'
-    COLOR_RESET=$'\033[0m'
-else
-    COLOR_INFO=""
-    COLOR_OK=""
-    COLOR_WARN=""
-    COLOR_ERROR=""
-    COLOR_RESET=""
-fi
-
-log() {
-    local level="$1"
-    local color="$2"
-    shift 2
-
-    local line
-    line="[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*"
-
-    printf '%s%s%s\n' "$color" "$line" "$COLOR_RESET"
-    printf '%s\n' "$line" >> "$LOG_FILE"
-}
-
-info()    { log INFO  "$COLOR_INFO"  "$*"; }
-success() { log OK    "$COLOR_OK"    "$*"; }
-
-# A warning condition is counted once. Explanatory lines for that same
-# condition are NOTE lines, so the final count reflects real issues rather
-# than the number of diagnostic messages printed.
-warn_condition() {
-    WARNING_COUNT=$((WARNING_COUNT + 1))
-    log WARN "$COLOR_WARN" "$*"
-}
-
-warn_note() {
-    log NOTE "$COLOR_WARN" "$*"
-}
-
-error() { log ERROR "$COLOR_ERROR" "$*"; }
-
-print_and_log() {
-    printf '%s\n' "$*" | tee -a "$LOG_FILE"
-}
-
-pause_before_exit() {
-    if [[ "${SCRIPT_PAUSE_ON_EXIT:-0}" == 1 && -t 0 ]]; then
-        echo
-        read -r -p "Press Enter to exit..." || true
-    fi
-}
-
-cleanup() {
-    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
-        rm -rf -- "$TMP_DIR"
-    fi
-}
-
-on_error() {
-    local exit_code=$?
-    local line_number="${1:-unknown}"
-
-    error "Maintenance failed at line ${line_number}, exit code ${exit_code}."
-    error "See the log: ${LOG_FILE}"
-    pause_before_exit
-    exit "$exit_code"
-}
-
-trap cleanup EXIT
-trap 'on_error "$LINENO"' ERR
-
-confirm() {
-    local prompt="$1"
-    local answer=""
-
-    [[ -t 0 ]] || return 1
-    read -r -p "${prompt} [y/N]: " answer || return 1
-    [[ "$answer" =~ ^[Yy]$ ]]
-}
-
-confirm_phrase() {
-    local prompt="$1"
-    local expected="$2"
-    local answer=""
-
-    [[ -t 0 ]] || return 1
-    read -r -p "${prompt} Type ${expected} to continue: " answer || return 1
-    [[ "$answer" == "$expected" ]]
-}
-
-run() {
-    info "Running: $(printf '%q ' "$@")"
-    "$@" 2>&1 | tee -a "$LOG_FILE"
-}
 
 simulate_to_file() {
     local output_file="$1"
     shift
 
     "$@" > "$output_file" 2>&1
-}
-
-require_commands() {
-    local command_name
-    local -a required_commands=(
-        apt apt-cache apt-get apt-mark awk df dpkg dpkg-query
-        fuser grep head mktemp sed sort sudo systemctl tee tr uname
-    )
-
-    for command_name in "${required_commands[@]}"; do
-        if ! command -v "$command_name" >/dev/null 2>&1; then
-            error "Required command is missing: ${command_name}"
-            return 1
-        fi
-    done
-
-    success "Required maintenance commands are available."
-}
-
-require_sudo() {
-    info "Checking sudo access..."
-    sudo -v
-    success "Sudo access confirmed."
 }
 
 check_apt_locks() {
@@ -167,7 +36,7 @@ check_apt_locks() {
 
         [[ -e "$lock" ]] || continue
 
-        if sudo fuser "$lock" >/dev/null 2>&1; then
+        if as_root fuser "$lock" >/dev/null 2>&1; then
             error "Another package-management process is using ${lock}."
             error "Wait for App Center, Software Updater, or unattended upgrades to finish."
             return 1
@@ -210,7 +79,7 @@ check_dpkg_state() {
     cat "$audit_file" | tee -a "$LOG_FILE"
 
     if confirm "Run 'sudo dpkg --configure -a' now?"; then
-        run sudo dpkg --configure -a
+        run_root dpkg --configure -a
         dpkg --audit > "$audit_file" 2>&1 || true
 
         if [[ -s "$audit_file" ]]; then
@@ -231,7 +100,7 @@ check_apt_health() {
 
     info "Checking APT dependency health (${phase})..."
 
-    if sudo apt-get check 2>&1 | tee -a "$LOG_FILE"; then
+    if as_root apt-get check 2>&1 | tee -a "$LOG_FILE"; then
         success "APT dependency check passed (${phase})."
         return 0
     fi
@@ -239,9 +108,9 @@ check_apt_health() {
     warn_condition "APT reported dependency problems (${phase})."
 
     if confirm "Run 'apt-get --fix-broken install' now?"; then
-        run sudo apt-get --fix-broken install
+        run_root apt-get --fix-broken install
 
-        if sudo apt-get check 2>&1 | tee -a "$LOG_FILE"; then
+        if as_root apt-get check 2>&1 | tee -a "$LOG_FILE"; then
             success "APT dependency health was repaired."
             return 0
         fi
@@ -272,10 +141,10 @@ report_manual_holds() {
 
 update_apt() {
     info "Updating APT package indexes..."
-    run sudo apt-get update
+    run_root apt-get update
 
     info "Installing normal updates while respecting Ubuntu phasing..."
-    run sudo apt-get upgrade -y --with-new-pkgs --no-remove
+    run_root apt-get upgrade -y --with-new-pkgs --no-remove
 }
 
 extract_inst_packages() {
@@ -317,7 +186,7 @@ handle_phased_updates() {
     warn_note "Installing these now bypasses Ubuntu's gradual rollout. The default is to leave them deferred."
 
     if confirm "Install these phased/deferred updates now?"; then
-        run sudo apt-get upgrade \
+        run_root apt-get upgrade \
             -y \
             --with-new-pkgs \
             --no-remove \
@@ -365,7 +234,7 @@ handle_full_upgrade() {
 
         warn_note "Because removals are proposed, this action requires stronger confirmation."
         if confirm_phrase "Apply this full upgrade?" "APPLY"; then
-            run sudo apt-get dist-upgrade -y
+            run_root apt-get dist-upgrade -y
         else
             info "Full upgrade was skipped."
         fi
@@ -373,7 +242,7 @@ handle_full_upgrade() {
     fi
 
     if confirm "Apply this full upgrade?"; then
-        run sudo apt-get dist-upgrade -y
+        run_root apt-get dist-upgrade -y
     else
         info "Full upgrade was skipped."
     fi
@@ -512,7 +381,7 @@ package_is_installed() {
 
 install_recommended_nvidia_driver() {
     if ubuntu-drivers install --help >/dev/null 2>&1; then
-        run sudo ubuntu-drivers install
+        run_root ubuntu-drivers install
         REBOOT_RECOMMENDED=1
     else
         warn_condition "This ubuntu-drivers version does not provide the 'install' command."
@@ -618,7 +487,7 @@ handle_firmware() {
             warn_condition "Firmware updates are available. Connect the laptop to AC power before applying them."
 
             if confirm "Install available firmware updates now?"; then
-                if output="$(sudo fwupdmgr update 2>&1)"; then
+                if output="$(as_root fwupdmgr update 2>&1)"; then
                     exit_code=0
                 else
                     exit_code=$?
@@ -688,7 +557,7 @@ handle_autoremove() {
     fi
 
     if confirm "Run APT autoremove with purge now?"; then
-        run sudo apt-get autoremove -y --purge
+        run_root apt-get autoremove -y --purge
     else
         info "APT autoremove was skipped."
     fi
@@ -696,7 +565,7 @@ handle_autoremove() {
 
 update_other_packages() {
     info "Removing obsolete cached APT packages..."
-    run sudo apt-get autoclean -y
+    run_root apt-get autoclean -y
 
     if command -v flatpak >/dev/null 2>&1; then
         info "Updating Flatpak applications and runtimes..."
@@ -710,7 +579,7 @@ update_other_packages() {
 
     if command -v snap >/dev/null 2>&1; then
         info "Refreshing Snap packages..."
-        run sudo snap refresh
+        run_root snap refresh
     else
         info "Snap is not installed; skipping."
     fi
@@ -780,49 +649,18 @@ offer_reboot() {
     if confirm "Restart the computer now?"; then
         info "Rebooting in 5 seconds..."
         sleep 5
-        sudo reboot
+        as_root reboot
     else
         info "Reboot skipped. Restart later to complete pending changes."
     fi
 }
 
-show_completion_summary() {
-    local duration=$(( $(date +%s) - START_TIME ))
-    local warning_label
-
-    if (( WARNING_COUNT == 0 )); then
-        success "System maintenance completed successfully with no warning conditions."
-    else
-        if (( WARNING_COUNT == 1 )); then
-            warning_label="1 warning condition"
-        else
-            warning_label="${WARNING_COUNT} warning conditions"
-        fi
-
-        # Do not increment WARNING_COUNT here: this reports the count; it is not
-        # another warning condition.
-        log SUMMARY "$COLOR_WARN" "System maintenance completed with ${warning_label}. Review the WARN/NOTE lines above."
-    fi
-
-    info "Total duration: ${duration} seconds"
-
-    echo
-    echo "============================================"
-    if (( WARNING_COUNT == 0 )); then
-        echo " Ubuntu system maintenance completed"
-    else
-        echo " Ubuntu maintenance completed with warnings"
-    fi
-    echo " Latest log: ${LOG_FILE}"
-    echo "============================================"
-}
-
 main() {
-    info "Starting Ubuntu system maintenance."
-    info "Script directory: ${SCRIPT_DIR}"
-    info "Log file: ${LOG_FILE}"
-
-    require_commands
+    initialize_runtime "$SCRIPT_DIR" update-system 'Ubuntu system maintenance'
+    require_commands \
+        apt apt-cache apt-get apt-mark awk df dpkg dpkg-query \
+        fuser grep head mktemp sed sort systemctl tee tr uname
+    create_temp_dir
     require_sudo
     check_apt_locks
     check_disk_space
@@ -845,7 +683,6 @@ main() {
 
     show_completion_summary
     offer_reboot
-    pause_before_exit
 }
 
 main "$@"
