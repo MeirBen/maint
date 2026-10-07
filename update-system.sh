@@ -77,7 +77,7 @@ print_and_log() {
 }
 
 pause_before_exit() {
-    if [[ -t 0 ]]; then
+    if [[ "${SCRIPT_PAUSE_ON_EXIT:-0}" == 1 && -t 0 ]]; then
         echo
         read -r -p "Press Enter to exit..." || true
     fi
