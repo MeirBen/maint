@@ -28,27 +28,21 @@ if [[ $# -ne 1 || ( "$1" != start && "$1" != stop && "$1" != update ) ]]; then
 fi
 
 ACTION="$1"
-
-# sudo already authenticated. Keep root out of the user's desktop session/logs.
-if (( EUID == 0 )); then
-    /usr/local/sbin/local-ai-service-control "$ACTION"
-    if [[ "$ACTION" == start ]]; then
-        echo 'Local AI is ready. Open http://127.0.0.1:8080 in your browser.'
-    fi
-    exit 0
-fi
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
 LOG_FILE="${LOG_DIR}/local-ai.log"
 
-# Keep repeated clicks from overwriting a log while its action is still running.
-exec 9>"${XDG_RUNTIME_DIR:-/run/user/$UID}/local-ai-control.lock"
+# Lock the same log for normal and sudo runs, before overwriting it.
+mkdir -p "$LOG_DIR"
+exec 9>>"$LOG_FILE"
 if ! flock --wait 180 9; then
     echo 'Another Local AI control is still running. Please try again.' >&2
     exit 1
 fi
-mkdir -p "$LOG_DIR"
+# A sudo run must leave the log writable by the owner of the scripts folder.
+if (( EUID == 0 )); then
+    chown --reference="$SCRIPT_DIR" -- "$LOG_DIR" "$LOG_FILE"
+fi
 : > "$LOG_FILE"
 
 log() {
@@ -82,18 +76,28 @@ elif [[ "$ACTION" == stop ]]; then
 else
     log INFO 'Checking for stable updates to Ollama, Phi, and Open WebUI…'
 fi
-log INFO 'Ubuntu may ask for your password to control the services.'
-/usr/bin/pkexec /usr/local/sbin/local-ai-service-control "$ACTION" 2>&1 | tee -a "$LOG_FILE"
+service_command=(/usr/local/sbin/local-ai-service-control "$ACTION")
+if (( EUID != 0 )); then
+    log INFO 'Checking sudo access...'
+    sudo -v
+    log OK 'Sudo access confirmed.'
+    service_command=(sudo "${service_command[@]}")
+fi
+"${service_command[@]}" 2>&1 | tee -a "$LOG_FILE"
 
 if [[ "$ACTION" == start ]]; then
     log OK 'Local AI is ready at http://127.0.0.1:8080'
-    log INFO 'Opening the browser chat…'
-    # Launch independently of this terminal; keep the browser alive until it exits.
-    if ! /usr/bin/systemd-run --user --collect --quiet --service-type=exec \
-        --property=ExitType=cgroup \
-        --property=StandardOutput=null --property=StandardError=null \
-        /usr/bin/xdg-open http://127.0.0.1:8080 >> "$LOG_FILE" 2>&1; then
-        log WARN 'Open http://127.0.0.1:8080 in your browser.'
+    if (( EUID == 0 )); then
+        log INFO 'Open http://127.0.0.1:8080 in your browser.'
+    else
+        log INFO 'Opening the browser chat…'
+        # Launch independently of this terminal; keep the browser alive until it exits.
+        if ! /usr/bin/systemd-run --user --collect --quiet --service-type=exec \
+            --property=ExitType=cgroup \
+            --property=StandardOutput=null --property=StandardError=null \
+            /usr/bin/xdg-open http://127.0.0.1:8080 >> "$LOG_FILE" 2>&1; then
+            log WARN 'Open http://127.0.0.1:8080 in your browser.'
+        fi
     fi
 elif [[ "$ACTION" == stop ]]; then
     log OK 'Both services are stopped. Your conversations and downloaded model are saved.'
