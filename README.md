@@ -37,9 +37,10 @@ Local AI uses `/usr/local/sbin/local-ai-service-control` and `/usr/local/libexec
 
 ## Checks
 
-Run from this folder:
+Run from the repository root (the directory containing `update-system.sh`). For the current installation:
 
 ```bash
+cd ~/Maintenance
 bash -n lib/common.sh
 bash -n update-system.sh
 bash -n local-ai.sh
