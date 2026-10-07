@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=System Maintenance
+GenericName=Ubuntu System Maintenance
+Comment=Safely update Ubuntu, drivers, firmware, Flatpak and Snap
+Exec=/usr/bin/env SCRIPT_PAUSE_ON_EXIT=1 /home/user/Maintenance/update-system.sh
+Icon=/home/user/Maintenance/icons/system-maintenance.png
+Terminal=true
+Categories=System;
+Keywords=update;upgrade;maintenance;drivers;firmware;cleanup;
+StartupNotify=true

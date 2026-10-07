@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Local AI
+Comment=Start, stop, or update Open WebUI, Ollama, and Phi
+Exec=/usr/bin/env SCRIPT_PAUSE_ON_EXIT=1 /home/user/Maintenance/local-ai.sh
+Icon=/home/user/Maintenance/icons/local-ai.png
+Terminal=true
+StartupNotify=true
+Categories=Utility;
