@@ -1,0 +1,12 @@
+# Runtime logs and maintenance temporary files
+/logs/
+
+# Local editor settings and temporary files
+/.vscode/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
