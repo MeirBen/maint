@@ -1,6 +1,8 @@
 """Safe regression checks: all service and administrator commands are substituted."""
 
 import errno
+import fcntl
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import pty
@@ -70,6 +72,132 @@ exit "${BROWSER_EXIT:-0}"
 
     def log(self, tool="probe"):
         return (self.toolkit / "logs" / (tool + ".log")).read_text()
+
+    def use_log_date(self, day):
+        self.env["LOG_TEST_DATE"] = day
+        self.command("date", '''#!/bin/bash
+if [[ "$*" == '+%F' ]]; then
+    printf '%s\\n' "$LOG_TEST_DATE"
+else
+    exec /usr/bin/date "$@"
+fi
+''')
+
+    def test_daily_logs_keep_every_run_and_roll_independently_for_each_tool(self):
+        self.use_log_date("2026-10-08")
+        for tool in ("update-system", "local-ai"):
+            with self.subTest(tool=tool):
+                path = self.probe('info "Run: $1"', tool)
+                self.assertEqual(self.run_script(path, "first").returncode, 0)
+                self.assertEqual(self.run_script(path, "second").returncode, 0)
+                latest = self.toolkit / "logs" / (tool + ".log")
+                day_one = self.toolkit / "logs" / tool / "2026-10-08.log"
+                self.assertTrue(latest.is_symlink())
+                self.assertEqual(latest.resolve(), day_one)
+                original = day_one.read_text()
+                self.assertIn("Run: first", original)
+                self.assertIn("Run: second", original)
+                result = self.run_script(path, "third", LOG_TEST_DATE="2026-10-09")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(day_one.read_text(), original)
+                self.assertIn("Run: third", self.log(tool))
+                self.assertNotIn("Run: first", self.log(tool))
+                self.assertEqual(latest.resolve().name, "2026-10-09.log")
+
+    def test_existing_latest_log_is_preserved_when_daily_logs_are_enabled(self):
+        self.use_log_date("2026-10-08")
+        latest = self.toolkit / "logs/probe.log"
+        latest.parent.mkdir()
+        latest.write_text("Existing restart error\n")
+        yesterday = datetime(2026, 10, 7, 12, tzinfo=timezone.utc).timestamp()
+        os.utime(latest, (yesterday, yesterday))
+        result = self.run_script(self.probe("info new-run"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((latest.parent / "probe/2026-10-07.log").is_file())
+        self.assertEqual((latest.parent / "probe/2026-10-07.log").read_text(),
+            "Existing restart error\n")
+        self.assertTrue(latest.is_symlink())
+        self.assertIn("new-run", self.log())
+
+    def test_retention_keeps_ninety_calendar_days_and_only_deletes_owned_log_files(self):
+        self.use_log_date("2026-10-08")
+        history = self.toolkit / "logs/probe"
+        history.mkdir(parents=True)
+        for name in ("2026-07-10.log", "2026-07-11.log", "2026-10-08.log", "notes.txt"):
+            (history/name).write_text(name + "\n")
+        other = self.toolkit / "logs/local-ai/2026-07-10.log"
+        other.parent.mkdir()
+        other.write_text("Other tool's log\n")
+        outside = self.root / "unrelated.log"
+        outside.write_text("Keep me\n")
+        link = history / "2026-07-09.log"
+        link.symlink_to(outside)
+        result = self.run_script(self.probe("info new-run"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((history/"2026-07-10.log").exists())
+        self.assertTrue((history/"2026-07-11.log").exists())
+        self.assertIn("2026-10-08.log", self.log())
+        self.assertTrue((history/"notes.txt").exists())
+        self.assertTrue(other.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(outside.read_text(), "Keep me\n")
+
+    def test_failed_local_ai_run_remains_available_after_a_later_success(self):
+        self.use_log_date("2026-10-08")
+        failed = self.run_script(self.toolkit / "local-ai.sh", "update", SERVICE_EXIT="43")
+        self.assertEqual(failed.returncode, 43, failed.stderr)
+        result = self.run_script(self.toolkit / "local-ai.sh", "start")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("exit code 43", self.log("local-ai"))
+        self.assertIn("Service action: start", self.log("local-ai"))
+
+    def test_daily_logs_stay_private_across_privilege_modes(self):
+        self.use_log_date("2026-10-08")
+        path = self.probe("info mode-check")
+        for uid in ("0", "1000"):
+            result = self.run_script(path, TEST_EUID=uid)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        history = self.toolkit / "logs/probe"
+        self.assertTrue(history.is_dir())
+        self.assertEqual(history.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((history/"2026-10-08.log").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.log().count("mode-check"), 2)
+
+    def test_legacy_migration_appends_without_overwriting_existing_daily_history(self):
+        self.use_log_date("2026-10-08")
+        history = self.toolkit / "logs/probe"
+        history.mkdir(parents=True)
+        daily_log = history / "2026-10-07.log"
+        daily_log.write_text("Earlier history\n")
+        legacy = self.toolkit / "logs/probe.log"
+        legacy.write_text("Legacy history\n")
+        yesterday = datetime(2026, 10, 7, 12, tzinfo=timezone.utc).timestamp()
+        os.utime(legacy, (yesterday, yesterday))
+        result = self.run_script(self.probe("info new-run"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(daily_log.read_text(), "Earlier history\nLegacy history\n")
+
+    def test_failed_log_date_lookup_does_not_destroy_previous_log(self):
+        legacy = self.toolkit / "logs/probe.log"
+        legacy.parent.mkdir()
+        legacy.write_text("Existing restart error\n")
+        self.command("date", '#!/bin/sh\nexit 44\n')
+        result = self.run_script(self.probe("info SHOULD_NOT_RUN"))
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assertIn("Existing restart error", legacy.read_text())
+        self.assertNotIn("SHOULD_NOT_RUN", legacy.read_text())
+
+    def test_migrated_logs_older_than_the_retention_window_expire(self):
+        self.use_log_date("2026-10-08")
+        legacy = self.toolkit / "logs/probe.log"
+        legacy.parent.mkdir()
+        legacy.write_text("Expired legacy history\n")
+        old_time = datetime(2026, 7, 10, 12, tzinfo=timezone.utc).timestamp()
+        os.utime(legacy, (old_time, old_time))
+        result = self.run_script(self.probe("info new-run"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((legacy.parent / "probe/2026-07-10.log").exists())
+        self.assertNotIn("Expired legacy history", self.log())
 
     def test_levels_warning_count_and_command_streams_share_plain_log(self):
         result = self.run_script(self.probe('''
@@ -342,6 +470,7 @@ if confirm_phrase 'Remove?' 'APPLY'; then info removal-approved; else info remov
         release = self.root / "release"
         first = self.probe(f'info first-run\ntouch {shlex.quote(str(ready))}\n'
             f'while [[ ! -e {shlex.quote(str(release))} ]]; do sleep 0.02; done')
+        first = first.rename(self.root / "first-run.sh")
         process = subprocess.Popen(["/bin/bash", str(first)], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, env=self.env)
         second = None
@@ -361,7 +490,7 @@ if confirm_phrase 'Remove?' 'APPLY'; then info removal-approved; else info remov
             self.assertEqual(process.wait(timeout=3), 0)
             self.assertEqual(second.wait(timeout=3), 0)
             self.assertIn("second-run", self.log())
-            self.assertNotIn("first-run", self.log())
+            self.assertIn("first-run", self.log())
         finally:
             release.touch()
             for child in (process, second):
@@ -369,6 +498,75 @@ if confirm_phrase 'Remove?' 'APPLY'; then info removal-approved; else info remov
                     if child.poll() is None:
                         child.kill()
                     child.communicate()
+
+    def test_day_rollover_waits_for_the_active_run_to_finish(self):
+        self.use_log_date("2026-10-08")
+        ready = self.root / "ready"
+        release = self.root / "release"
+        path = self.probe('info first-run\n' + f'touch {shlex.quote(str(ready))}\n' +
+            f'while [[ ! -e {shlex.quote(str(release))} ]]; do sleep 0.02; done\ninfo first-finished')
+        path = path.rename(self.root / "first-run.sh")
+        first = subprocess.Popen(["/bin/bash", str(path)], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=self.env)
+        second = None
+        try:
+            deadline = time.monotonic() + 3
+            while not ready.exists() and time.monotonic() < deadline and first.poll() is None:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists())
+            second_path = self.probe("info second-run")
+            second = subprocess.Popen(["/bin/bash", str(second_path)], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+                env={**self.env, "LOG_TEST_DATE": "2026-10-09"})
+            with self.assertRaises(subprocess.TimeoutExpired):
+                second.communicate(timeout=0.2)
+            self.assertEqual((self.toolkit / "logs/probe.log").resolve().name, "2026-10-08.log")
+            release.touch()
+            self.assertEqual(first.wait(timeout=3), 0)
+            self.assertEqual(second.wait(timeout=3), 0)
+            previous = (self.toolkit / "logs/probe/2026-10-08.log").read_text()
+            self.assertIn("first-finished", previous)
+            self.assertNotIn("second-run", previous)
+            self.assertIn("second-run", self.log())
+            self.assertNotIn("first-run", self.log())
+        finally:
+            release.touch()
+            for child in (first, second):
+                if child:
+                    if child.poll() is None:
+                        child.kill()
+                    child.communicate()
+
+    def test_waiting_across_midnight_keeps_the_run_start_date(self):
+        clock_file = self.root / "clock-date"
+        clock_file.write_text("2026-10-08\n")
+        self.env["CLOCK_DATE_FILE"] = str(clock_file)
+        self.command("date", '''#!/bin/bash
+if [[ "$*" == '+%F' ]]; then
+    cat "$CLOCK_DATE_FILE"
+else
+    exec /usr/bin/date "$@"
+fi
+''')
+        logs = self.toolkit / "logs"
+        logs.mkdir()
+        with (logs / ".probe.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process = subprocess.Popen(["/bin/bash", str(self.probe("info waited-run"))],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env)
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    process.communicate(timeout=0.2)
+                clock_file.write_text("2026-10-09\n")
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                output = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 0, output)
+                self.assertEqual((logs / "probe.log").resolve().name, "2026-10-08.log")
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
 
 
 if __name__ == "__main__":

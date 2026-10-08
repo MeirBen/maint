@@ -8,7 +8,7 @@ set -Eeuo pipefail
 #   - full upgrades are simulated first and require explicit confirmation
 #   - package removals require stronger confirmation
 #   - firmware, autoremove, and NVIDIA branch changes require confirmation
-#   - one overwritten log is kept at <script-folder>/logs/update-system.log
+#   - daily logs are retained for 90 days under <script-folder>/logs/update-system/
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh

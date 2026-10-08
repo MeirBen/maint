@@ -23,11 +23,13 @@ local-ai update         # Update Ollama, the Phi model, and Open WebUI
 - `update-system.sh` — Ubuntu maintenance.
 - `local-ai.sh` — local AI controls.
 - `lib/common.sh` — shared logging, authentication, prompts, and cleanup.
-- `logs/` — latest `update-system.log` and `local-ai.log`, replaced on each run.
+- `logs/update-system/` and `logs/local-ai/` — `YYYY-MM-DD.log` files containing every run started that day.
 - `icons/` and `*.desktop` — desktop launchers and icons.
 - `tests/test_toolkit.py` — isolated regression tests.
 
 Only one run of each tool can proceed at a time; another waits up to 180 seconds. Temporary files are cleaned up on exit.
+
+`logs/update-system.log` and `logs/local-ai.log` link to the latest run's daily log. Each tool keeps today and the previous 89 days, removing older logs when it next runs. Existing logs move into daily history under the same retention policy.
 
 ## Installed paths
 

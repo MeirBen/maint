@@ -17,10 +17,16 @@ initialize_runtime() {
     if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
         COLOR_ENABLED=1
     fi
+    local run_day
+    run_day="$(date +%F)"
 
-    # Normal and sudo runs share the same lock. Never truncate an active log.
+    # Lock a stable file: the current-log link changes when the day changes.
     mkdir -p -- "$LOG_DIR"
-    exec 9>>"$LOG_FILE"
+    local lock_file="${LOG_DIR}/.$2.lock"
+    exec 9>>"$lock_file"
+    if (( EUID == 0 )); then
+        chown --reference="$SCRIPT_DIR" -- "$LOG_DIR" "$lock_file"
+    fi
     if ! flock --wait 180 9; then
         printf 'Another %s run is still active. Please try again.\n' "$TASK_LABEL" >&2
         exec 9>&-
@@ -33,14 +39,49 @@ initialize_runtime() {
     trap 'RUNTIME_INTERRUPTED=1; exit 130' INT
     trap 'RUNTIME_INTERRUPTED=1; exit 143' TERM
 
-    # Keep files created by sudo usable by the toolkit's owner afterwards.
-    if (( EUID == 0 )); then
-        chown --reference="$SCRIPT_DIR" -- "$LOG_DIR" "$LOG_FILE"
-    fi
-    : > "$LOG_FILE"
+    prepare_daily_log "$2" "$run_day"
     info "Starting ${TASK_LABEL}."
     info "Script directory: ${SCRIPT_DIR}"
     info "Log file: ${LOG_FILE}"
+}
+
+prepare_daily_log() {
+    local tool="$1" day="$2" history_dir="${LOG_DIR}/$1"
+    local cutoff daily_log legacy_day legacy_log path name
+    # Today plus the preceding 89 calendar days, independent of DST changes.
+    cutoff="$(date --date="${day} 12:00:00 89 days ago" +%F)"
+    daily_log="${history_dir}/${day}.log"
+    mkdir -p -- "$history_dir"
+
+    # Preserve the regular latest-log file used before daily rotation.
+    if [[ -f "$LOG_FILE" && ! -L "$LOG_FILE" ]]; then
+        legacy_day="$(date --reference="$LOG_FILE" +%F)"
+        legacy_log="${history_dir}/${legacy_day}.log"
+        if [[ -e "$legacy_log" ]]; then
+            cat -- "$LOG_FILE" >> "$legacy_log"
+            rm -- "$LOG_FILE"
+        else
+            mv -- "$LOG_FILE" "$legacy_log"
+        fi
+        if (( EUID == 0 )); then
+            chown --reference="$SCRIPT_DIR" -- "$legacy_log"
+        fi
+    fi
+
+    : >> "$daily_log"
+    if (( EUID == 0 )); then
+        chown --reference="$SCRIPT_DIR" -- "$history_dir" "$daily_log"
+    fi
+    ln -sfnT -- "${tool}/${day}.log" "$LOG_FILE"
+
+    # Only this tool's regular dated logs are eligible for retention cleanup.
+    for path in "$history_dir"/*.log; do
+        [[ -f "$path" && ! -L "$path" ]] || continue
+        name="${path##*/}"
+        if [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\.log$ && "${name%.log}" < "$cutoff" ]]; then
+            rm -- "$path"
+        fi
+    done
 }
 
 log() {
