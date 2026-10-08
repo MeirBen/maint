@@ -647,9 +647,15 @@ offer_reboot() {
     (( REBOOT_RECOMMENDED == 1 )) || return 0
 
     if confirm "Restart the computer now?"; then
-        info "Rebooting in 5 seconds..."
+        info "Requesting restart in 5 seconds..."
         sleep 5
-        as_root reboot
+        if run_root reboot; then
+            success "Restart request accepted."
+        else
+            local exit_code=$?
+            error "Restart request failed (exit code ${exit_code}). See the reason above and in ${LOG_FILE}."
+            return "$exit_code"
+        fi
     else
         info "Reboot skipped. Restart later to complete pending changes."
     fi

@@ -170,14 +170,14 @@ info 'No actions approved'
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("No actions approved", result.stdout)
 
-    def system_feature_probe(self, body):
+    def system_feature_probe(self, body, tool="probe"):
         path = self.toolkit / "system-feature-probe.sh"
         source = (self.toolkit / "update-system.sh").read_text()
         self.assertTrue(source.rstrip().endswith('main "$@"'))
         # Load the real feature functions without executing system maintenance.
         definitions = source[:source.rfind('main "$@"')]
-        path.write_text(definitions + '\ninitialize_runtime "$SCRIPT_DIR" probe "Test task"\n'
-            'create_temp_dir\n' + body + "\n")
+        path.write_text(definitions + '\ninitialize_runtime "$SCRIPT_DIR" ' + shlex.quote(tool) +
+            ' "Test task"\ncreate_temp_dir\n' + body + "\n")
         return path
 
     def test_full_upgrade_with_removals_requires_exact_apply(self):
@@ -211,6 +211,34 @@ fi
                 self.assertEqual(self.trace.exists(), response == "y\n")
                 if self.trace.exists():
                     self.assertIn("reboot", self.trace.read_text().splitlines())
+
+    def test_reboot_failure_keeps_diagnostic_and_status_in_both_launch_modes(self):
+        self.command("reboot", '''#!/bin/sh
+echo 'Restart refused: an application is blocking shutdown.' >&2
+exit 42
+''')
+        self.command("sleep", '#!/bin/sh\nexit 0\n')
+        path = self.system_feature_probe("REBOOT_RECOMMENDED=1\noffer_reboot", "reboot-test")
+        for uid in ("0", "1000"):
+            for desktop in (False, True):
+                with self.subTest(uid=uid, desktop=desktop):
+                    self.env["TEST_EUID"] = uid
+                    status, output = self.terminal_run(path, desktop=desktop,
+                        replies=(("[y/N]:", "y\n"),))
+                    self.assertEqual(status, 42, output)
+                    self.assertIn("Restart refused: an application is blocking shutdown.",
+                        self.log("reboot-test"))
+                    self.assertIn("Restart request failed", output)
+                    self.assertNotIn("Restart request accepted", output)
+                    self.assertEqual("Press Enter to exit" in output, desktop)
+
+    def test_accepted_reboot_request_is_logged(self):
+        self.command("reboot", '#!/bin/sh\nexit 0\n')
+        self.command("sleep", '#!/bin/sh\nexit 0\n')
+        path = self.system_feature_probe("REBOOT_RECOMMENDED=1\noffer_reboot")
+        status, output = self.terminal_run(path, replies=(("[y/N]:", "y\n"),))
+        self.assertEqual(status, 0, output)
+        self.assertIn("Restart request accepted", self.log())
 
     def test_termination_cleans_temporary_files_and_releases_lock(self):
         ready = self.root / "ready"
