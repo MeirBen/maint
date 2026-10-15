@@ -33,6 +33,7 @@ class ToolkitTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(source.read_text().replace("EUID", "TEST_EUID")
                     .replace("/usr/local/sbin/local-ai-service-control", str(self.bin / "service"))
+                    .replace("/usr/bin/docker", str(self.bin / "docker"))
                     .replace("/usr/bin/systemd-run", str(self.bin / "browser")))
         self.trace = self.root / "trace"
         self.env = {**os.environ, "PATH": str(self.bin) + ":/usr/bin:/bin",
@@ -272,6 +273,115 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
         self.assertIn("exit code 43", self.log("local-ai"))
         self.assertNotIn("completed successfully", self.log("local-ai"))
 
+    def configure_local_ai_status(self):
+        self.command("systemctl", '''#!/bin/bash
+printf 'systemctl:%s\\n' "$*" >> "$TRACE"
+[[ $# -eq 2 && "$1" == is-active ]] || exit 90
+case "$2" in
+    ollama.service) state="${OLLAMA_STATE:-active}" ;;
+    docker.service) state="${DOCKER_STATE:-active}" ;;
+    *) exit 90 ;;
+esac
+if [[ "$state" == unavailable ]]; then echo 'Service manager unavailable' >&2; exit 1; fi
+printf '%s\\n' "$state"
+[[ "$state" == active || "$state" == reloading ]] || exit 3
+''')
+        self.command("docker", '''#!/bin/bash
+printf 'docker:%s\\n' "$*" >> "$TRACE"
+[[ $# -eq 8 && "$1" == --host && "$2" == unix:///var/run/docker.sock &&
+    "$3" == inspect && "$4" == --type && "$5" == container &&
+    "$6" == --format && "$8" == open-webui ]] || exit 90
+if [[ "${DOCKER_EXIT:-0}" != 0 ]]; then echo 'Cannot inspect container' >&2; exit "$DOCKER_EXIT"; fi
+printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
+''')
+
+    def test_local_ai_status_from_menu_and_cli_only_reads_service_state(self):
+        self.configure_local_ai_status()
+        for arguments, input_text in (([], "4\n"), (["status"], "")):
+            for uid in ("0", "1000"):
+                with self.subTest(arguments=arguments, uid=uid):
+                    self.trace.unlink(missing_ok=True)
+                    result = self.run_script(self.toolkit / "local-ai.sh", *arguments,
+                        input=input_text, TEST_EUID=uid)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for text in ("Ollama: RUNNING", "Docker: RUNNING",
+                            "Open WebUI: RUNNING (health: healthy)"):
+                        self.assertIn(text, result.stdout)
+                        self.assertIn(text, self.log("local-ai"))
+                    trace = self.trace.read_text()
+                    self.assertNotIn("service:", trace)
+                    self.assertNotIn("browser:", trace)
+                    self.assertIn("docker:--host unix:///var/run/docker.sock inspect", trace)
+
+    def test_local_ai_status_handles_stopped_failed_and_transitioning_services(self):
+        self.configure_local_ai_status()
+        for state, expected in (("inactive", "NOT RUNNING"), ("failed", "FAILED"),
+                ("activating", "ACTIVATING"), ("deactivating", "DEACTIVATING"),
+                ("reloading", "RELOADING")):
+            with self.subTest(state=state):
+                result = self.run_script(self.toolkit / "local-ai.sh", "status",
+                    OLLAMA_STATE=state, CONTAINER_STATE="exited|unhealthy")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Ollama: " + expected, result.stdout)
+                self.assertIn("Open WebUI: NOT RUNNING (exited)", result.stdout)
+                self.assertNotIn("health: unhealthy", result.stdout)
+
+    def test_stopped_container_does_not_report_stale_health_as_current(self):
+        self.configure_local_ai_status()
+        result = self.run_script(self.toolkit / "local-ai.sh", "status",
+            OLLAMA_STATE="inactive", CONTAINER_STATE="exited|unhealthy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Open WebUI: NOT RUNNING (exited)", result.stdout)
+        self.assertIn("Health checks are inactive while the container is stopped", result.stdout)
+        self.assertNotIn("unhealthy", result.stdout)
+        self.assertNotIn("[WARN]", result.stdout)
+
+    def test_running_unhealthy_container_produces_a_warning_summary(self):
+        self.configure_local_ai_status()
+        result = self.run_script(self.toolkit / "local-ai.sh", "status",
+            CONTAINER_STATE="running|unhealthy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[WARN] Open WebUI: RUNNING (health: unhealthy)", result.stdout)
+        self.assertIn("1 warning condition", result.stdout)
+        self.assertNotIn("completed successfully with no warning conditions", result.stdout)
+
+    def test_status_distinguishes_startup_paused_and_failed_containers(self):
+        self.configure_local_ai_status()
+        for state, expected, warning in (
+                ("running|starting", "RUNNING (health: starting)", False),
+                ("running|none", "RUNNING (no health check configured)", False),
+                ("paused|healthy", "PAUSED (health checks are inactive)", False),
+                ("restarting|unhealthy", "RESTARTING", True),
+                ("dead|unhealthy", "FAILED (dead)", True)):
+            with self.subTest(state=state):
+                result = self.run_script(self.toolkit / "local-ai.sh", "status",
+                    CONTAINER_STATE=state)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Open WebUI: " + expected, result.stdout)
+                self.assertEqual("[WARN]" in result.stdout, warning)
+
+    def test_status_does_not_activate_stopped_docker_to_inspect_the_container(self):
+        self.configure_local_ai_status()
+        result = self.run_script(self.toolkit / "local-ai.sh", "status", DOCKER_STATE="inactive")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Docker: NOT RUNNING", result.stdout)
+        self.assertIn("Open WebUI: UNKNOWN", result.stdout)
+        trace = self.trace.read_text()
+        for forbidden in ("docker:", "sudo:", "service:", "browser:"):
+            self.assertNotIn(forbidden, trace)
+
+    def test_status_query_failures_are_logged_without_reporting_stopped(self):
+        self.configure_local_ai_status()
+        result = self.run_script(self.toolkit / "local-ai.sh", "status",
+            OLLAMA_STATE="unavailable", DOCKER_EXIT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ollama: UNKNOWN", result.stdout)
+        self.assertIn("Docker: RUNNING", result.stdout)
+        self.assertIn("Open WebUI: UNKNOWN", result.stdout)
+        self.assertNotIn("NOT RUNNING", result.stdout)
+        self.assertIn("Service manager unavailable", self.log("local-ai"))
+        self.assertIn("Cannot inspect container", self.log("local-ai"))
+
     def test_browser_failure_is_a_warning_not_a_service_failure(self):
         result = self.run_script(self.toolkit / "local-ai.sh", "start", BROWSER_EXIT="7")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -282,7 +392,7 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
         log = self.toolkit / "logs/local-ai.log"
         log.parent.mkdir()
         log.write_text("Previous run\n")
-        for arguments, input_text, expected in (([], "4\n", 0), ([], "", 0),
+        for arguments, input_text, expected in (([], "5\n", 0), ([], "", 0),
                 (["unknown"], "", 2), (["start", "extra"], "", 2)):
             result = self.run_script(self.toolkit / "local-ai.sh", *arguments, input=input_text)
             self.assertEqual(result.returncode, expected, result.stderr)

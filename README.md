@@ -10,6 +10,7 @@ local-ai                # Open the action menu
 local-ai start          # Start Ollama/Open WebUI and open the chat
 local-ai stop
 local-ai update         # Update Ollama, the Phi model, and Open WebUI
+local-ai status         # Show Ollama, Docker, and Open WebUI status (menu option 4)
 ```
 
 - Commands ask for your password when needed. Running with `sudo` also works.
@@ -17,6 +18,8 @@ local-ai update         # Update Ollama, the Phi model, and Open WebUI
 - Normal APT, Flatpak, and Snap updates run automatically. APT respects phased updates. Unused Flatpak runtimes and old APT cache files are cleaned automatically.
 - Full upgrades, phasing overrides, APT package removals, driver/firmware installs, and rebooting require confirmation. Full upgrades that remove packages require typing `APPLY`.
 - `sudo local-ai start` prints the chat URL instead of opening the browser.
+- Status reports running, stopped, failed, or transitional service states and Open WebUI's container state/health. It asks for administrator access to inspect the container when Docker is running. If Docker is stopped or a query fails, unavailable status is reported as `UNKNOWN`; status checks do not start services. Exit is menu option 5.
+- Container health is shown only while Open WebUI is running; a stopped container's retained health value is not a current health check. A running unhealthy container is reported as a warning.
 
 ## Files
 
