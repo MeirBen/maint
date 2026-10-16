@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034 # MODULE_TITLE and MODULE_ACTIONS are read by maintenance.sh.
 # Local AI: Open WebUI and Ollama service controls.
 
 MODULE_TITLE='Local AI'

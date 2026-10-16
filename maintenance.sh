@@ -6,6 +6,7 @@ set -Eeuo pipefail
 #   maintenance MODULE           menu of one module's actions
 #   maintenance MODULE ACTION    run one action
 #   maintenance help             list every command
+#   maintenance list             list every action as MODULE<TAB>ACTION<TAB>TITLE<TAB>DESCRIPTION
 
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # shellcheck source=lib/common.sh
@@ -20,6 +21,7 @@ declare -A MODULE_TITLES=()
 load_modules() {
     local file id rows title action description
     for file in "${MAINTENANCE_ROOT}"/modules/*.sh; do
+        [[ -e "$file" ]] || continue
         id="${file##*/}"
         id="${id%.sh}"
         if ! rows="$(describe_module "$file")"; then
@@ -65,13 +67,23 @@ find_entry() {
 
 usage() {
     local index
-    echo 'Usage: maintenance [MODULE [ACTION]]'
+    echo 'Usage: maintenance [MODULE [ACTION]] | help | list'
     echo
     echo 'Without arguments, opens the menu. With MODULE only, opens its menu.'
+    echo 'list prints every action as tab-separated MODULE, ACTION, TITLE, DESCRIPTION.'
     echo
     for index in "${!ENTRY_MODULES[@]}"; do
         printf '  %-30s %s\n' "maintenance ${ENTRY_MODULES[index]} ${ENTRY_ACTIONS[index]}" \
             "${ENTRY_DESCRIPTIONS[index]}"
+    done
+}
+
+# Machine-readable registry for other front ends; keep the columns stable.
+list_actions() {
+    local index
+    for index in "${!ENTRY_MODULES[@]}"; do
+        printf '%s\t%s\t%s\t%s\n' "${ENTRY_MODULES[index]}" "${ENTRY_ACTIONS[index]}" \
+            "${MODULE_TITLES[${ENTRY_MODULES[index]}]}" "${ENTRY_DESCRIPTIONS[index]}"
     done
 }
 
@@ -141,6 +153,7 @@ main() {
     case "$#:${1:-}" in
         0:) run_menu ;;
         1:help|1:-h|1:--help) usage ;;
+        1:list) list_actions ;;
         1:*)
             if [[ -z "${MODULE_TITLES[$1]+set}" ]]; then
                 usage >&2

@@ -9,6 +9,7 @@ maintenance                    # Menu of every action; returns to the menu after
 maintenance local-ai           # Menu of one module's actions
 maintenance local-ai start     # Run one action and exit
 maintenance help               # List every command
+maintenance list               # Every action as tab-separated MODULE, ACTION, TITLE, DESCRIPTION
 ```
 
 | Command | Action |
@@ -37,10 +38,12 @@ Local AI actions call `/usr/local/sbin/local-ai-service-control` and `/usr/local
 
 ## Adding a module
 
-Drop a file into `modules/`. Its name is the module name, and it only defines variables and functions:
+Drop a file such as `modules/disk.sh` into `modules/`. Its name is the module name, and it only defines variables and functions:
 
 ```bash
-# modules/disk.sh
+# shellcheck shell=bash disable=SC2034 # MODULE_TITLE and MODULE_ACTIONS are read by maintenance.sh.
+# Disk: filesystem upkeep.
+
 MODULE_TITLE='Disk'
 MODULE_ACTIONS=(
     'trim|Trim mounted SSD filesystems'
@@ -54,6 +57,15 @@ action_trim() {
 ```
 
 Each `name|description` entry needs an `action_<name>` function. The menu, `help`, and `maintenance disk trim` pick it up automatically; a module that fails to load is skipped with a message. Actions use the helpers in `lib/common.sh`: `info`, `success`, `warn_condition`, `warn_note`, `error`, `run`, `run_root`, `as_root`, `require_sudo`, `require_commands`, `confirm`, `confirm_phrase`, `create_temp_dir`, and `show_completion_summary`. Any failing command stops the action and is logged with its call chain. A running action shares its namespace with `maintenance.sh` and `lib/common.sh`, so modules must not redefine their functions (such as `main`, `usage`, `run_action`, or `info`).
+
+## Front ends
+
+The terminal menu is one front end. Another, such as a desktop UI, can drive the same command line:
+
+- Discover actions with `maintenance list`, run one with `maintenance MODULE ACTION`, and read its exit code: `0` success, `129`/`130`/`143` interrupted, anything else a failure (a command that is not in the list exits with `2`).
+- Output lines read `[YYYY-MM-DD HH:MM:SS] [LEVEL] message` (`INFO`, `OK`, `WARN`, `NOTE`, `SUMMARY`, `ERROR`), uncolored when output is not a terminal, interleaved with the output of commands the action runs.
+- Without a terminal, every confirmation answers No, so a full upgrade, driver or firmware install, or reboot is skipped. A front end that approves them must provide its own prompt through `confirm` and `confirm_phrase` in `lib/common.sh`.
+- Administrator access goes only through `require_sudo`, `as_root`, and `run_root` in `lib/common.sh`; a front end without a terminal needs a graphical sudo helper there, such as `SUDO_ASKPASS` or pkexec.
 
 ## Files
 
@@ -76,7 +88,7 @@ for file in maintenance.sh lib/common.sh modules/*.sh install.sh uninstall.sh; d
 python3 -B -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Tests use temporary files and fake system commands; they do not install updates or change services. Optional lint, if ShellCheck is installed:
+Tests use temporary files and fake system commands; they do not install updates or change services. Lint, if ShellCheck is installed (expected output: none):
 
 ```bash
 shellcheck -x -P SCRIPTDIR maintenance.sh lib/common.sh modules/*.sh install.sh uninstall.sh

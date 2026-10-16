@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034 # MODULE_TITLE and MODULE_ACTIONS are read by maintenance.sh.
 # Ubuntu workstation maintenance.
 # Conservative by design:
 #   - normal APT upgrades are installed automatically
