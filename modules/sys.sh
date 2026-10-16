@@ -43,7 +43,7 @@ action_update() {
     update_other_packages
     show_status
 
-    # Summarize before the reboot prompt; the runner's later call then logs nothing.
+    # Summarize before the reboot prompt; the automatic summary at exit then logs nothing.
     show_completion_summary
     offer_reboot
 }

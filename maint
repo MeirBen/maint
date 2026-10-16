@@ -21,6 +21,11 @@ load_modules() {
         [[ -e "$file" ]] || continue
         id="${file##*/}"
         id="${id%.sh}"
+        case "$id" in
+            help|-h|--help|list)
+                printf 'Skipping module %s: %s is a built-in command.\n' "${file##*/}" "$id" >&2
+                continue ;;
+        esac
         if ! rows="$(describe_module "$file")"; then
             printf 'Skipping module %s: it failed to load.\n' "${file##*/}" >&2
             continue

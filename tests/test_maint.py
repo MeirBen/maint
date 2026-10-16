@@ -18,7 +18,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 PROBE_MODULE = '''
 MODULE_TITLE='Probe'
 MODULE_ACTIONS=('work|Do probe work' 'wait|Wait for a signal' 'fail|Fail in a helper'
-    'early|Summarize early')
+    'early|Summarize early' 'quit|Exit early')
 action_work() {
     create_temp_dir
     info 'probe-work'
@@ -32,6 +32,7 @@ action_wait() {
 action_fail() { fail_helper; }
 fail_helper() { run /bin/bash -c 'exit 42'; }
 action_early() { show_completion_summary; info after-summary; }
+action_quit() { info leaving; exit 0; }
 '''
 
 
@@ -497,6 +498,8 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
         self.add_probe_module()
         (self.maint_root / "modules/broken.sh").write_text("MODULE_TITLE='Broken'\nMODULE_ACTIONS=('go|Go')\n")
         (self.maint_root / "modules/empty.sh").write_text("MODULE_TITLE='Empty'\n")
+        (self.maint_root / "modules/help.sh").write_text(
+            "MODULE_TITLE='Help'\nMODULE_ACTIONS=('go|Go')\naction_go() { info help-go; }\n")
         (self.maint_root / "modules/noisy.sh").write_text(
             "MODULE_TITLE='Noisy'\nMODULE_ACTIONS=('go|Go')\necho noise-at-load\naction_go() { :; }\n")
         help_text = self.maint("help")
@@ -507,21 +510,25 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
         self.assertIn("Skipping module broken.sh", help_text.stderr)
         self.assertIn("Skipping module empty.sh", help_text.stderr)
         self.assertNotIn("unbound", help_text.stderr)
+        self.assertIn("Skipping module help.sh: help is a built-in command.", help_text.stderr)
         listing = self.maint("list")
         self.assertEqual(listing.returncode, 0, listing.stderr)
         self.assertIn("probe\twork\tProbe\tDo probe work\n", listing.stdout)
         self.assertIn("ai\tstart\tLocal AI\t", listing.stdout)
         self.assertIn("noisy\tgo\tNoisy\tGo\n", listing.stdout)
         self.assertNotIn("noise-at-load", listing.stdout)
+        self.assertNotIn("help\t", listing.stdout)
         self.assertNotIn("broken", listing.stdout)
         result = self.maint("probe", input="1\n0\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("probe-work", self.log())
         self.assertEqual(self.maint("broken", "go").returncode, 2)
+        self.assertEqual(self.maint("help", "go").returncode, 2)
 
     def test_runner_summarizes_each_action_exactly_once(self):
         self.add_probe_module()
-        for action, expected_tail in (("work", "probe-work"), ("early", "after-summary")):
+        for action, expected_tail in (("work", "probe-work"), ("early", "after-summary"),
+                ("quit", "leaving")):
             with self.subTest(action=action):
                 (self.maint_root / "logs/probe.log").unlink(missing_ok=True)
                 for path in (self.maint_root / "logs/probe").glob("*.log"):
@@ -648,9 +655,9 @@ exit 42
                     return "\n"
 
                 result, output = self.terminal_run(self.entry_point, "probe", replies=(
-                    ("Choose [0-4]:", "1\n"),
+                    ("Choose [0-5]:", "1\n"),
                     ("Press Enter to return to the menu", check_released),
-                    ("Choose [0-4]:", "0\n")))
+                    ("Choose [0-5]:", "0\n")))
                 self.assertEqual(result, 0, output)
                 self.assertEqual(second_run[0].returncode, 0, second_run[0].stderr)
                 self.assertIn("probe-work", output)
@@ -670,7 +677,7 @@ exit 42
         for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             with self.subTest(signal_number=signal_number):
                 status, output = self.terminal_run(self.entry_point, "probe",
-                    replies=(("Choose [0-4]:", "2\n"),), interrupt=signal_number)
+                    replies=(("Choose [0-5]:", "2\n"),), interrupt=signal_number)
                 self.assertEqual(status, 128 + signal_number, output)
                 self.assertNotIn("Press Enter", output)
                 self.wait_for_lock()

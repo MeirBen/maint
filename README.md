@@ -38,7 +38,7 @@ Changes apply on the next run; nothing needs reinstalling.
 
 ## Writing a module
 
-Drop a file such as `modules/disk.sh` into `modules/`. Its name is the module name, and it only defines variables and functions:
+Drop a file such as `modules/disk.sh` into `modules/`. Its name is the module name (`help` and `list` are taken by the built-in commands), and it only defines variables and functions:
 
 ```bash
 # shellcheck shell=bash disable=SC2034 # MODULE_TITLE and MODULE_ACTIONS are read by maint.

@@ -200,6 +200,8 @@ on_exit() {
     elif (( status != 0 && ! FAILURE_LOGGED )); then
         # An unset variable or a bare exit fails without a failing command, so on_error never ran.
         error "${TASK_LABEL} failed with exit code ${status}. See the log: ${LOG_FILE}" || true
+    elif (( status == 0 )); then
+        show_completion_summary || status=$?
     fi
     if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && ! rm -rf -- "$TMP_DIR"; then
         error "Could not remove temporary folder: ${TMP_DIR}" || true
@@ -208,8 +210,8 @@ on_exit() {
     exit "$status"
 }
 
-# Logs the warning count and duration once per run. The runner calls it after each successful
-# action, so an action calls it only to log the summary earlier.
+# Logs the warning count and duration once per run. on_exit calls it when a run succeeds, so an
+# action calls it only to log the summary earlier.
 show_completion_summary() {
     local duration=$((SECONDS - START_TIME)) warning_label
     if (( SUMMARY_SHOWN )); then

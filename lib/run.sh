@@ -11,4 +11,3 @@ source "${MAINT_ROOT}/modules/$1.sh"
 
 initialize_runtime "$1" "${MODULE_TITLE} $2"
 "action_$2"
-show_completion_summary
