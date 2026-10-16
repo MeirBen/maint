@@ -1,76 +1,59 @@
 #!/usr/bin/env bash
-# Shared runtime for the Maintenance tools. Source from a Bash entry script.
+# Shared runtime for maintenance actions: daily logs, locking, privileges, prompts, cleanup.
 
+MAINTENANCE_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Starts an action run: takes the per-tool lock, opens today's log, installs traps.
 initialize_runtime() {
-    SCRIPT_DIR="$1"
-    TASK_LABEL="$3"
-    LOG_DIR="${SCRIPT_DIR}/logs"
-    LOG_FILE="${LOG_DIR}/$2.log"
+    local tool="$1" run_day lock_file
+    TASK_LABEL="$2"
+    LOG_DIR="${MAINTENANCE_ROOT}/logs"
+    LOG_FILE="${LOG_DIR}/${tool}.log"
     TMP_DIR=""
     WARNING_COUNT=0
     START_TIME=$SECONDS
     COLOR_ENABLED=0
-    RUNTIME_INTERRUPTED=0
+    INTERRUPTED_BY=""
 
     umask 077
     export LC_ALL=C
     if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
         COLOR_ENABLED=1
     fi
-    local run_day
     run_day="$(date +%F)"
 
     # Lock a stable file: the current-log link changes when the day changes.
     mkdir -p -- "$LOG_DIR"
-    local lock_file="${LOG_DIR}/.$2.lock"
+    lock_file="${LOG_DIR}/.${tool}.lock"
     exec 9>>"$lock_file"
     if (( EUID == 0 )); then
-        chown --reference="$SCRIPT_DIR" -- "$LOG_DIR" "$lock_file"
+        chown --reference="$MAINTENANCE_ROOT" -- "$LOG_DIR" "$lock_file"
     fi
     if ! flock --wait 180 9; then
         printf 'Another %s run is still active. Please try again.\n' "$TASK_LABEL" >&2
-        exec 9>&-
         return 1
     fi
 
     trap 'on_error "$?" "$LINENO"' ERR
     trap on_exit EXIT
-    trap 'RUNTIME_INTERRUPTED=1; exit 129' HUP
-    trap 'RUNTIME_INTERRUPTED=1; exit 130' INT
-    trap 'RUNTIME_INTERRUPTED=1; exit 143' TERM
+    trap 'INTERRUPTED_BY=SIGHUP; exit 129' HUP
+    trap 'INTERRUPTED_BY=SIGINT; exit 130' INT
+    trap 'INTERRUPTED_BY=SIGTERM; exit 143' TERM
 
-    prepare_daily_log "$2" "$run_day"
-    info "Starting ${TASK_LABEL}."
-    info "Script directory: ${SCRIPT_DIR}"
+    prepare_daily_log "$tool" "$run_day"
+    info "===== ${TASK_LABEL} | user $(id -un) | pid $$ ====="
     info "Log file: ${LOG_FILE}"
 }
 
 prepare_daily_log() {
-    local tool="$1" day="$2" history_dir="${LOG_DIR}/$1"
-    local cutoff daily_log legacy_day legacy_log path name
+    local tool="$1" day="$2" history_dir="${LOG_DIR}/$1" cutoff daily_log path name
     # Today plus the preceding 89 calendar days, independent of DST changes.
     cutoff="$(date --date="${day} 12:00:00 89 days ago" +%F)"
     daily_log="${history_dir}/${day}.log"
     mkdir -p -- "$history_dir"
-
-    # Preserve the regular latest-log file used before daily rotation.
-    if [[ -f "$LOG_FILE" && ! -L "$LOG_FILE" ]]; then
-        legacy_day="$(date --reference="$LOG_FILE" +%F)"
-        legacy_log="${history_dir}/${legacy_day}.log"
-        if [[ -e "$legacy_log" ]]; then
-            cat -- "$LOG_FILE" >> "$legacy_log"
-            rm -- "$LOG_FILE"
-        else
-            mv -- "$LOG_FILE" "$legacy_log"
-        fi
-        if (( EUID == 0 )); then
-            chown --reference="$SCRIPT_DIR" -- "$legacy_log"
-        fi
-    fi
-
     : >> "$daily_log"
     if (( EUID == 0 )); then
-        chown --reference="$SCRIPT_DIR" -- "$history_dir" "$daily_log"
+        chown --reference="$MAINTENANCE_ROOT" -- "$history_dir" "$daily_log"
     fi
     ln -sfnT -- "${tool}/${day}.log" "$LOG_FILE"
 
@@ -178,41 +161,35 @@ create_temp_dir() {
     TMP_DIR="$(mktemp -d "${LOG_DIR}/maintenance.XXXXXX")"
 }
 
-pause_before_exit() {
-    if [[ "${SCRIPT_PAUSE_ON_EXIT:-0}" == 1 && -t 0 ]]; then
-        echo
-        read -r -p 'Press Enter to exit...' || true
-    fi
-}
-
+# Logs the failing call chain, e.g. "action_update (system.sh:33) > run (common.sh:113)".
 on_error() {
-    local exit_code="$1" line_number="$2"
+    local status="$1" line="$2" frame last=$(( ${#FUNCNAME[@]} - 1 )) trace=""
     trap - ERR
+    # Frame 0 is on_error itself; the last frame is the script body, shown only when it failed there.
+    if (( last > 1 )); then last=$(( last - 1 )); fi
+    for (( frame = 1; frame <= last; frame++ )); do
+        if (( frame > 1 )); then line="${BASH_LINENO[frame - 1]}"; fi
+        trace="${FUNCNAME[frame]} (${BASH_SOURCE[frame]##*/}:${line})${trace:+ > ${trace}}"
+    done
     # A logging failure must not hide the original command's exit status.
-    error "${TASK_LABEL} failed at line ${line_number}, exit code ${exit_code}." || true
+    error "${TASK_LABEL} failed with exit code ${status} at: ${trace}" || true
     error "See the log: ${LOG_FILE}" || true
-    exit "$exit_code"
+    exit "$status"
 }
 
 on_exit() {
-    local exit_code=$?
+    local status=$?
     trap - ERR EXIT
-    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
-        if ! rm -rf -- "$TMP_DIR"; then
-            error "Could not remove temporary folder: ${TMP_DIR}" || true
-            if (( exit_code == 0 )); then exit_code=1; fi
-        fi
+    # Finish cleanup even if another signal arrives.
+    trap '' HUP INT TERM
+    if [[ -n "$INTERRUPTED_BY" ]]; then
+        error "${TASK_LABEL} was interrupted (${INTERRUPTED_BY}). See the log: ${LOG_FILE}" || true
     fi
-    if ! flock --unlock 9; then
-        error 'Could not release the log lock.' || true
-        if (( exit_code == 0 )); then exit_code=1; fi
+    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && ! rm -rf -- "$TMP_DIR"; then
+        error "Could not remove temporary folder: ${TMP_DIR}" || true
+        if (( status == 0 )); then status=1; fi
     fi
-    exec 9>&-
-    # Desktop readers should not hold locks or temporary files while paused.
-    if (( RUNTIME_INTERRUPTED == 0 )); then
-        pause_before_exit
-    fi
-    exit "$exit_code"
+    exit "$status"
 }
 
 show_completion_summary() {

@@ -1,61 +1,82 @@
 # Maintenance
 
-Ubuntu maintenance and local AI scripts in `~/Maintenance`.
+One command and one desktop launcher for Ubuntu maintenance and the local AI stack.
 
 ## Usage
 
 ```bash
-update-system           # Update and clean up Ubuntu
-local-ai                # Open the action menu
-local-ai start          # Start Ollama/Open WebUI and open the chat
-local-ai stop
-local-ai update         # Update Ollama, the Phi model, and Open WebUI
-local-ai status         # Show Ollama, Docker, and Open WebUI status (menu option 4)
+maintenance                    # Menu of every action; returns to the menu after each one
+maintenance local-ai           # Menu of one module's actions
+maintenance local-ai start     # Run one action and exit
+maintenance help               # List every command
 ```
 
-- Commands ask for your password when needed. Running with `sudo` also works.
-- CLI runs exit when finished. Desktop launches wait for Enter. Menus and confirmation prompts still apply in both modes.
-- Normal APT, Flatpak, and Snap updates run automatically. APT respects phased updates. Unused Flatpak runtimes and old APT cache files are cleaned automatically.
-- Full upgrades, phasing overrides, APT package removals, driver/firmware installs, and rebooting require confirmation. Full upgrades that remove packages require typing `APPLY`.
-- `sudo local-ai start` prints the chat URL instead of opening the browser.
-- Status reports running, stopped, failed, or transitional service states and Open WebUI's container state/health. It asks for administrator access to inspect the container when Docker is running. If Docker is stopped or a query fails, unavailable status is reported as `UNKNOWN`; status checks do not start services. Exit is menu option 5.
-- Container health is shown only while Open WebUI is running; a stopped container's retained health value is not a current health check. A running unhealthy container is reported as a warning.
+| Command | Action |
+| --- | --- |
+| `maintenance system update` | Update and clean up Ubuntu: APT, drivers, firmware, Flatpak, Snap |
+| `maintenance local-ai start` | Start Open WebUI + Ollama and open the chat |
+| `maintenance local-ai stop` | Stop Open WebUI + Ollama |
+| `maintenance local-ai update` | Update Ollama, the Phi model, and Open WebUI |
+| `maintenance local-ai status` | Show Ollama, Docker, and Open WebUI status |
+
+- Actions ask for your password when needed. Running with `sudo` also works; `sudo maintenance local-ai start` prints the chat URL instead of opening the browser.
+- System update installs normal APT, Flatpak, and Snap updates automatically and respects APT phased updates. Phasing overrides, full upgrades, package removals, driver and firmware installs, and rebooting ask first; full upgrades that remove packages require typing `APPLY`.
+- Status only reads service state and never starts services. It reports `UNKNOWN` when Docker is stopped or a query fails, and shows container health only while Open WebUI is running.
+- Ctrl+C, closing the terminal, or `SIGTERM` stops the running action, cleans up, and exits the menu.
+
+## Install
+
+```bash
+./install.sh
+```
+
+Run it as your own user; it asks for sudo only to link `/usr/local/bin/maintenance`. It also creates the trusted `Maintenance` launcher on the desktop. Re-run it after moving this folder.
+
+Local AI actions call `/usr/local/sbin/local-ai-service-control` and `/usr/local/libexec/local-ai-update.py`, which are installed separately from this repository.
+
+## Adding a module
+
+Drop a file into `modules/`. Its name is the module name, and it only defines variables and functions:
+
+```bash
+# modules/disk.sh
+MODULE_TITLE='Disk'
+MODULE_ACTIONS=(
+    'trim|Trim mounted SSD filesystems'
+)
+
+action_trim() {
+    require_sudo
+    run_root fstrim --all --verbose
+    show_completion_summary
+}
+```
+
+Each `name|description` entry needs an `action_<name>` function. The menu, `help`, and `maintenance disk trim` pick it up automatically; a module that fails to load is skipped with a message. Actions use the helpers in `lib/common.sh`: `info`, `success`, `warn_condition`, `warn_note`, `error`, `run`, `run_root`, `as_root`, `require_sudo`, `require_commands`, `confirm`, `confirm_phrase`, `create_temp_dir`, and `show_completion_summary`. Any failing command stops the action and is logged with its call chain. A running action shares its namespace with `maintenance.sh` and `lib/common.sh`, so modules must not redefine their functions (such as `main`, `usage`, `run_action`, or `info`).
 
 ## Files
 
-- `update-system.sh` — Ubuntu maintenance.
-- `local-ai.sh` — local AI controls.
-- `lib/common.sh` — shared logging, authentication, prompts, and cleanup.
-- `logs/update-system/` and `logs/local-ai/` — `YYYY-MM-DD.log` files containing every run started that day.
-- `icons/` and `*.desktop` — desktop launchers and icons.
+- `maintenance.sh` — command line, menu, and module registry.
+- `lib/common.sh` — logging, locking, privileges, prompts, and cleanup for each action run.
+- `modules/` — one file per feature area.
+- `install.sh`, `icons/` — command link and desktop launcher.
 - `tests/test_toolkit.py` — isolated regression tests.
 
-Only one run of each tool can proceed at a time; another waits up to 180 seconds. Temporary files are cleaned up on exit.
+## Logs
 
-`logs/update-system.log` and `logs/local-ai.log` link to the latest run's daily log. Each tool keeps today and the previous 89 days, removing older logs when it next runs. Existing logs move into daily history under the same retention policy.
-
-## Installed paths
-
-CLI wrappers live in `/usr/local/bin`. Desktop shortcuts link to the `.desktop` files here. If you move this folder, update the wrappers, desktop links, and launcher `Exec`/`Icon` paths. Keep `lib/common.sh` with the scripts.
-
-Local AI uses `/usr/local/sbin/local-ai-service-control` and `/usr/local/libexec/local-ai-update.py`. These helpers and the CLI wrappers are outside this repository; copying it alone does not install them.
+Each module writes to `logs/<module>/YYYY-MM-DD.log`, keeping today and the previous 89 days; `logs/<module>.log` links to today's file. Every run starts with a `=====` header naming the action, user, and process ID, and failures or interruptions are logged with their cause. Only one run of each module proceeds at a time; another waits up to 180 seconds.
 
 ## Checks
 
-Run from the repository root (the directory containing `update-system.sh`). For the current installation:
+From the repository root:
 
 ```bash
-cd ~/Maintenance
-bash -n lib/common.sh
-bash -n update-system.sh
-bash -n local-ai.sh
+for file in maintenance.sh lib/common.sh modules/*.sh install.sh; do bash -n "$file"; done
 python3 -B -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Tests use temporary files and fake system commands; they do not install updates or change services. Syntax checks print nothing when successful; the test suite ends with `OK`.
-
-Optional lint check, only if ShellCheck is installed (the scripts do not require it):
+Tests use temporary files and fake system commands; they do not install updates or change services. Optional lint, if ShellCheck is installed:
 
 ```bash
-shellcheck -x -P SCRIPTDIR lib/common.sh update-system.sh local-ai.sh
+shellcheck -x -P SCRIPTDIR maintenance.sh lib/common.sh modules/*.sh install.sh
 ```

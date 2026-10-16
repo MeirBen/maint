@@ -1,6 +1,4 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
+# shellcheck shell=bash
 # Ubuntu workstation maintenance.
 # Conservative by design:
 #   - normal APT upgrades are installed automatically
@@ -8,21 +6,62 @@ set -Eeuo pipefail
 #   - full upgrades are simulated first and require explicit confirmation
 #   - package removals require stronger confirmation
 #   - firmware, autoremove, and NVIDIA branch changes require confirmation
-#   - daily logs are retained for 90 days under <script-folder>/logs/update-system/
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
-source "${SCRIPT_DIR}/lib/common.sh"
+MODULE_TITLE='Ubuntu system'
+MODULE_ACTIONS=(
+    'update|Update and clean up Ubuntu (APT, drivers, firmware, Flatpak, Snap)'
+)
 
 REBOOT_RECOMMENDED=0
 PHASED_OPTION="APT::Get::Always-Include-Phased-Updates=true"
 MIN_ROOT_FREE_KIB=$((2 * 1024 * 1024)) # 2 GiB
 
-simulate_to_file() {
-    local output_file="$1"
-    shift
+action_update() {
+    require_commands \
+        apt apt-cache apt-get apt-mark awk df dpkg dpkg-query \
+        fuser grep head mktemp sort systemctl tee tr uname
+    create_temp_dir
+    require_sudo
+    check_apt_locks
+    check_disk_space
+    check_dpkg_state
+    check_apt_health "before upgrades"
+    report_manual_holds
 
-    "$@" > "$output_file" 2>&1
+    export DEBIAN_FRONTEND=noninteractive
+
+    update_apt
+    handle_phased_updates
+    handle_full_upgrade
+    check_apt_health "after upgrades"
+    audit_remaining_apt_updates
+    handle_nvidia
+    handle_firmware
+    handle_autoremove
+    update_other_packages
+    show_status
+
+    show_completion_summary
+    offer_reboot
+}
+
+# Prints the sorted package names of one APT simulation operation (Inst or Remv).
+extract_packages() {
+    awk -v operation="$1" '$1 == operation {print $2}' "$2" | sort -u
+}
+
+# Logs each non-empty input line as an indented list item.
+print_list() {
+    local marker="$1" item
+    while IFS= read -r item; do
+        if [[ -n "$item" ]]; then
+            print_and_log "  ${marker} ${item}"
+        fi
+    done
+}
+
+simulate_phased_upgrade() {
+    apt-get --simulate upgrade --with-new-pkgs --no-remove -o "$PHASED_OPTION" > "$1" 2>&1
 }
 
 check_apt_locks() {
@@ -47,16 +86,14 @@ check_apt_locks() {
 }
 
 check_disk_space() {
-    local available_kib
-    local available_human
+    local available_kib available_human
 
     available_kib="$(df --output=avail -k / | awk 'NR == 2 {print $1}')"
     available_human="$(df -h / | awk 'NR == 2 {print $4}')"
 
     info "Root filesystem free space: ${available_human}"
 
-    if [[ "$available_kib" =~ ^[0-9]+$ ]] &&
-       (( available_kib < MIN_ROOT_FREE_KIB )); then
+    if [[ "$available_kib" =~ ^[0-9]+$ ]] && (( available_kib < MIN_ROOT_FREE_KIB )); then
         error "Less than 2 GiB is free on the root filesystem."
         return 1
     fi
@@ -76,50 +113,50 @@ check_dpkg_state() {
     fi
 
     warn_condition "dpkg reports packages that may need attention:"
-    cat "$audit_file" | tee -a "$LOG_FILE"
+    tee -a "$LOG_FILE" < "$audit_file"
 
-    if confirm "Run 'sudo dpkg --configure -a' now?"; then
-        run_root dpkg --configure -a
-        dpkg --audit > "$audit_file" 2>&1 || true
-
-        if [[ -s "$audit_file" ]]; then
-            cat "$audit_file" | tee -a "$LOG_FILE"
-            error "dpkg still reports an unhealthy package state."
-            return 1
-        fi
-
-        success "dpkg state is healthy after repair."
-    else
+    if ! confirm "Run 'sudo dpkg --configure -a' now?"; then
         error "Stopping before upgrades because dpkg is not in a clean state."
         return 1
     fi
+
+    run_root dpkg --configure -a
+    dpkg --audit > "$audit_file" 2>&1 || true
+
+    if [[ -s "$audit_file" ]]; then
+        tee -a "$LOG_FILE" < "$audit_file"
+        error "dpkg still reports an unhealthy package state."
+        return 1
+    fi
+
+    success "dpkg state is healthy after repair."
 }
 
 check_apt_health() {
-    local phase="${1:-current}"
+    local phase="$1"
 
     info "Checking APT dependency health (${phase})..."
 
-    if as_root apt-get check 2>&1 | tee -a "$LOG_FILE"; then
+    if run_root apt-get check; then
         success "APT dependency check passed (${phase})."
         return 0
     fi
 
     warn_condition "APT reported dependency problems (${phase})."
 
-    if confirm "Run 'apt-get --fix-broken install' now?"; then
-        run_root apt-get --fix-broken install
-
-        if as_root apt-get check 2>&1 | tee -a "$LOG_FILE"; then
-            success "APT dependency health was repaired."
-            return 0
-        fi
-
-        error "APT dependency problems remain after repair."
+    if ! confirm "Run 'apt-get --fix-broken install' now?"; then
+        error "Stopping because APT dependency health is not clean."
         return 1
     fi
 
-    error "Stopping because APT dependency health is not clean."
+    run_root apt-get --fix-broken install
+
+    if run_root apt-get check; then
+        success "APT dependency health was repaired."
+        return 0
+    fi
+
+    error "APT dependency problems remain after repair."
     return 1
 }
 
@@ -134,9 +171,7 @@ report_manual_holds() {
     fi
 
     info "Manually held APT packages:"
-    while IFS= read -r package; do
-        [[ -n "$package" ]] && print_and_log "  - ${package}"
-    done < "$holds_file"
+    print_list - < "$holds_file"
 }
 
 update_apt() {
@@ -147,31 +182,21 @@ update_apt() {
     run_root apt-get upgrade -y --with-new-pkgs --no-remove
 }
 
-extract_inst_packages() {
-    awk '/^Inst / {print $2}' "$1" | sort -u
-}
-
-extract_remv_packages() {
-    awk '/^Remv / {print $2}' "$1" | sort -u
-}
-
 handle_phased_updates() {
     local sim_file="${TMP_DIR}/phased-upgrade.sim"
+    local packages_file="${TMP_DIR}/phased-packages.txt"
     local count
 
     info "Checking for phased/deferred updates..."
 
-    if ! simulate_to_file "$sim_file" \
-        apt-get --simulate upgrade \
-        --with-new-pkgs \
-        --no-remove \
-        -o "$PHASED_OPTION"; then
+    if ! simulate_phased_upgrade "$sim_file"; then
         cat "$sim_file" >> "$LOG_FILE"
         warn_condition "Could not simulate phased updates; continuing without overriding phasing."
         return 0
     fi
 
-    count="$(extract_inst_packages "$sim_file" | wc -l)"
+    extract_packages Inst "$sim_file" > "$packages_file"
+    count="$(wc -l < "$packages_file")"
 
     if (( count == 0 )); then
         success "No updates become installable by overriding Ubuntu phasing."
@@ -179,18 +204,12 @@ handle_phased_updates() {
     fi
 
     warn_condition "${count} update(s) become installable when Ubuntu phasing is overridden:"
-    while IFS= read -r package; do
-        [[ -n "$package" ]] && print_and_log "  - ${package}"
-    done < <(extract_inst_packages "$sim_file")
+    print_list - < "$packages_file"
 
     warn_note "Installing these now bypasses Ubuntu's gradual rollout. The default is to leave them deferred."
 
     if confirm "Install these phased/deferred updates now?"; then
-        run_root apt-get upgrade \
-            -y \
-            --with-new-pkgs \
-            --no-remove \
-            -o "$PHASED_OPTION"
+        run_root apt-get upgrade -y --with-new-pkgs --no-remove -o "$PHASED_OPTION"
     else
         info "Phased/deferred updates were left for Ubuntu's normal rollout."
     fi
@@ -198,19 +217,22 @@ handle_phased_updates() {
 
 handle_full_upgrade() {
     local sim_file="${TMP_DIR}/full-upgrade.sim"
-    local install_count
-    local remove_count
+    local install_file="${TMP_DIR}/full-upgrade-install.txt"
+    local remove_file="${TMP_DIR}/full-upgrade-remove.txt"
+    local install_count remove_count approved
 
     info "Simulating a full upgrade..."
 
-    if ! simulate_to_file "$sim_file" apt-get --simulate dist-upgrade; then
+    if ! apt-get --simulate dist-upgrade > "$sim_file" 2>&1; then
         cat "$sim_file" >> "$LOG_FILE"
         warn_condition "Could not simulate a full upgrade; no full upgrade will be attempted."
         return 0
     fi
 
-    install_count="$(extract_inst_packages "$sim_file" | wc -l)"
-    remove_count="$(extract_remv_packages "$sim_file" | wc -l)"
+    extract_packages Inst "$sim_file" > "$install_file"
+    extract_packages Remv "$sim_file" > "$remove_file"
+    install_count="$(wc -l < "$install_file")"
+    remove_count="$(wc -l < "$remove_file")"
 
     if (( install_count == 0 && remove_count == 0 )); then
         success "No full-upgrade operation is needed."
@@ -221,37 +243,23 @@ handle_full_upgrade() {
 
     if (( install_count > 0 )); then
         info "Packages a full upgrade would install or upgrade:"
-        while IFS= read -r package; do
-            [[ -n "$package" ]] && print_and_log "  + ${package}"
-        done < <(extract_inst_packages "$sim_file")
+        print_list + < "$install_file"
     fi
 
     if (( remove_count > 0 )); then
         warn_note "Packages a full upgrade would REMOVE:"
-        while IFS= read -r package; do
-            [[ -n "$package" ]] && print_and_log "  - ${package}"
-        done < <(extract_remv_packages "$sim_file")
-
+        print_list - < "$remove_file"
         warn_note "Because removals are proposed, this action requires stronger confirmation."
-        if confirm_phrase "Apply this full upgrade?" "APPLY"; then
-            run_root apt-get dist-upgrade -y
-        else
-            info "Full upgrade was skipped."
-        fi
-        return 0
+        confirm_phrase "Apply this full upgrade?" "APPLY" && approved=1 || approved=0
+    else
+        confirm "Apply this full upgrade?" && approved=1 || approved=0
     fi
 
-    if confirm "Apply this full upgrade?"; then
+    if (( approved )); then
         run_root apt-get dist-upgrade -y
     else
         info "Full upgrade was skipped."
     fi
-}
-
-list_upgradable_packages() {
-    apt list --upgradable 2>/dev/null |
-        awk -F/ 'NR > 1 && $1 != "" {print $1}' |
-        sort -u
 }
 
 package_installed_version() {
@@ -264,23 +272,23 @@ package_candidate_version() {
     printf '%s' "${candidate:-unknown}"
 }
 
+package_is_installed() {
+    [[ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null || true)" == ii* ]]
+}
+
 audit_remaining_apt_updates() {
     local pending_file="${TMP_DIR}/pending-upgrades.txt"
     local holds_file="${TMP_DIR}/pending-holds.txt"
-    local phased_file="${TMP_DIR}/pending-phased.sim"
-    local full_file="${TMP_DIR}/pending-full.sim"
+    local sim_file="${TMP_DIR}/pending.sim"
     local phased_packages="${TMP_DIR}/pending-phased-packages.txt"
     local full_packages="${TMP_DIR}/pending-full-packages.txt"
-    local count=0
-    local unresolved_count=0
-    local package
-    local reason
-    local installed
-    local candidate
+    local count unresolved_count=0 package reason
 
     info "Auditing packages that remain upgradable after APT maintenance..."
 
-    list_upgradable_packages > "$pending_file" || true
+    apt list --upgradable 2>/dev/null |
+        awk -F/ 'NR > 1 && $1 != "" {print $1}' |
+        sort -u > "$pending_file" || true
 
     if [[ ! -s "$pending_file" ]]; then
         success "No APT packages remain upgradable."
@@ -289,20 +297,14 @@ audit_remaining_apt_updates() {
 
     apt-mark showhold 2>/dev/null | sort -u > "$holds_file" || true
 
-    if simulate_to_file "$phased_file" \
-        apt-get --simulate upgrade \
-        --with-new-pkgs \
-        --no-remove \
-        -o "$PHASED_OPTION"; then
-        extract_inst_packages "$phased_file" > "$phased_packages"
-    else
-        : > "$phased_packages"
+    : > "$phased_packages"
+    if simulate_phased_upgrade "$sim_file"; then
+        extract_packages Inst "$sim_file" > "$phased_packages"
     fi
 
-    if simulate_to_file "$full_file" apt-get --simulate dist-upgrade; then
-        extract_inst_packages "$full_file" > "$full_packages"
-    else
-        : > "$full_packages"
+    : > "$full_packages"
+    if apt-get --simulate dist-upgrade > "$sim_file" 2>&1; then
+        extract_packages Inst "$sim_file" > "$full_packages"
     fi
 
     count="$(wc -l < "$pending_file")"
@@ -322,9 +324,7 @@ audit_remaining_apt_updates() {
             unresolved_count=$((unresolved_count + 1))
         fi
 
-        installed="$(package_installed_version "$package")"
-        candidate="$(package_candidate_version "$package")"
-        print_and_log "  - ${package}: ${installed} -> ${candidate} [${reason}]"
+        print_and_log "  - ${package}: $(package_installed_version "$package") -> $(package_candidate_version "$package") [${reason}]"
     done < "$pending_file"
 
     if (( unresolved_count > 0 )); then
@@ -334,29 +334,20 @@ audit_remaining_apt_updates() {
 }
 
 nvidia_branch() {
-    local text="$1"
-
-    if [[ "$text" =~ ([0-9]{3}) ]]; then
+    if [[ "$1" =~ ([0-9]{3}) ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
     fi
-
-    return 0
 }
 
 active_nvidia_version() {
     command -v nvidia-smi >/dev/null 2>&1 || return 0
 
-    nvidia-smi \
-        --query-gpu=driver_version \
-        --format=csv,noheader \
-        2>/dev/null |
+    nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null |
         head -n 1 |
         tr -d '[:space:]' || true
 }
 
 recommended_nvidia_package() {
-    command -v ubuntu-drivers >/dev/null 2>&1 || return 0
-
     ubuntu-drivers devices 2>/dev/null |
         awk '
             /recommended/ {
@@ -370,31 +361,8 @@ recommended_nvidia_package() {
         ' || true
 }
 
-package_is_installed() {
-    [[ "$(
-        dpkg-query -W \
-            -f='${db:Status-Abbrev}' \
-            "$1" \
-            2>/dev/null || true
-    )" == ii* ]]
-}
-
-install_recommended_nvidia_driver() {
-    if ubuntu-drivers install --help >/dev/null 2>&1; then
-        run_root ubuntu-drivers install
-        REBOOT_RECOMMENDED=1
-    else
-        warn_condition "This ubuntu-drivers version does not provide the 'install' command."
-    fi
-}
-
 handle_nvidia() {
-    local active_version
-    local active_branch
-    local recommended_package
-    local recommended_branch
-    local installed_version
-    local candidate_version
+    local active_version active_branch recommended_package
 
     if ! command -v ubuntu-drivers >/dev/null 2>&1; then
         info "ubuntu-drivers is unavailable; skipping NVIDIA recommendation checks."
@@ -405,9 +373,7 @@ handle_nvidia() {
     info "Running kernel: $(uname -r)"
 
     active_version="$(active_nvidia_version)"
-    active_branch="$(nvidia_branch "$active_version")"
     recommended_package="$(recommended_nvidia_package)"
-    recommended_branch="$(nvidia_branch "$recommended_package")"
 
     if [[ -n "$active_version" ]]; then
         info "Active NVIDIA driver version: ${active_version}"
@@ -421,12 +387,10 @@ handle_nvidia() {
     fi
 
     info "Ubuntu-recommended NVIDIA package: ${recommended_package}"
+    info "Recommended package version: installed=$(package_installed_version "$recommended_package"), candidate=$(package_candidate_version "$recommended_package")"
 
-    installed_version="$(package_installed_version "$recommended_package")"
-    candidate_version="$(package_candidate_version "$recommended_package")"
-    info "Recommended package version: installed=${installed_version}, candidate=${candidate_version}"
-
-    if [[ -n "$active_branch" && "$active_branch" == "$recommended_branch" ]]; then
+    active_branch="$(nvidia_branch "$active_version")"
+    if [[ -n "$active_branch" && "$active_branch" == "$(nvidia_branch "$recommended_package")" ]]; then
         success "The active NVIDIA branch matches Ubuntu's recommendation."
         return 0
     fi
@@ -440,16 +404,18 @@ handle_nvidia() {
 
     warn_condition "The active/installed NVIDIA driver branch does not match Ubuntu's recommendation."
 
-    if confirm "Install Ubuntu's recommended NVIDIA driver now?"; then
-        install_recommended_nvidia_driver
-    else
+    if ! confirm "Install Ubuntu's recommended NVIDIA driver now?"; then
         info "NVIDIA driver installation was skipped."
+    elif ubuntu-drivers install --help >/dev/null 2>&1; then
+        run_root ubuntu-drivers install
+        REBOOT_RECOMMENDED=1
+    else
+        warn_condition "This ubuntu-drivers version does not provide the 'install' command."
     fi
 }
 
 handle_firmware() {
-    local output
-    local exit_code
+    local status
 
     if ! command -v fwupdmgr >/dev/null 2>&1; then
         info "fwupd is not installed; skipping firmware checks."
@@ -457,72 +423,43 @@ handle_firmware() {
     fi
 
     info "Refreshing firmware metadata..."
-
-    if output="$(fwupdmgr refresh 2>&1)"; then
-        exit_code=0
-    else
-        exit_code=$?
-    fi
-
-    printf '%s\n' "$output" | tee -a "$LOG_FILE"
-
-    case "$exit_code" in
+    status=0
+    run fwupdmgr refresh || status=$?
+    case "$status" in
         0) success "Firmware metadata refreshed." ;;
         2) success "Firmware metadata is already up to date." ;;
-        *) warn_condition "Firmware metadata refresh failed with exit code ${exit_code}; continuing." ;;
+        *) warn_condition "Firmware metadata refresh failed with exit code ${status}; continuing." ;;
     esac
 
     info "Checking for firmware updates..."
+    status=0
+    run fwupdmgr get-updates || status=$?
+    case "$status" in
+        0) offer_firmware_update ;;
+        2) success "No supported firmware updates are available." ;;
+        3) info "No supported firmware update resource was found." ;;
+        *) warn_condition "Firmware update check failed with exit code ${status}; continuing." ;;
+    esac
+}
 
-    if output="$(fwupdmgr get-updates 2>&1)"; then
-        exit_code=0
-    else
-        exit_code=$?
+offer_firmware_update() {
+    local status=0
+
+    warn_condition "Firmware updates are available. Connect the laptop to AC power before applying them."
+
+    if ! confirm "Install available firmware updates now?"; then
+        info "Firmware updates were skipped."
+        return 0
     fi
 
-    printf '%s\n' "$output" | tee -a "$LOG_FILE"
-
-    case "$exit_code" in
+    run_root fwupdmgr update || status=$?
+    case "$status" in
         0)
-            warn_condition "Firmware updates are available. Connect the laptop to AC power before applying them."
-
-            if confirm "Install available firmware updates now?"; then
-                if output="$(as_root fwupdmgr update 2>&1)"; then
-                    exit_code=0
-                else
-                    exit_code=$?
-                fi
-
-                printf '%s\n' "$output" | tee -a "$LOG_FILE"
-
-                case "$exit_code" in
-                    0)
-                        success "Firmware update command completed."
-                        REBOOT_RECOMMENDED=1
-                        ;;
-                    2)
-                        success "No firmware action was needed."
-                        ;;
-                    3)
-                        warn_condition "Firmware resource was not found."
-                        ;;
-                    *)
-                        warn_condition "Firmware update failed with exit code ${exit_code}."
-                        ;;
-                esac
-            else
-                info "Firmware updates were skipped."
-            fi
-            ;;
-        2)
-            success "No supported firmware updates are available."
-            ;;
-        3)
-            info "No supported firmware update resource was found."
-            ;;
-        *)
-            warn_condition "Firmware update check failed with exit code ${exit_code}; continuing."
-            ;;
+            success "Firmware update command completed."
+            REBOOT_RECOMMENDED=1 ;;
+        2) success "No firmware action was needed." ;;
+        3) warn_condition "Firmware resource was not found." ;;
+        *) warn_condition "Firmware update failed with exit code ${status}." ;;
     esac
 }
 
@@ -533,13 +470,13 @@ handle_autoremove() {
 
     info "Checking for unused automatically installed packages..."
 
-    if ! simulate_to_file "$sim_file" apt-get --simulate autoremove --purge; then
+    if ! apt-get --simulate autoremove --purge > "$sim_file" 2>&1; then
         cat "$sim_file" >> "$LOG_FILE"
         warn_condition "Could not simulate autoremove; continuing without removing packages."
         return 0
     fi
 
-    extract_remv_packages "$sim_file" > "$packages_file"
+    extract_packages Remv "$sim_file" > "$packages_file"
     remove_count="$(wc -l < "$packages_file")"
 
     if (( remove_count == 0 )); then
@@ -548,9 +485,7 @@ handle_autoremove() {
     fi
 
     warn_condition "${remove_count} unused package(s) can be removed:"
-    while IFS= read -r package; do
-        [[ -n "$package" ]] && print_and_log "  - ${package}"
-    done < "$packages_file"
+    print_list - < "$packages_file"
 
     if grep -Eq '^(linux-(image|headers|modules)|nvidia-)' "$packages_file"; then
         warn_note "The autoremove proposal contains kernel and/or NVIDIA packages. Review the list carefully before approving it."
@@ -585,11 +520,9 @@ update_other_packages() {
     fi
 }
 
-reboot_is_required() {
-    [[ -f /run/reboot-required || -f /var/run/reboot-required ]]
-}
-
 show_status() {
+    local renderer gpu
+
     info "Running kernel: $(uname -r)"
 
     if package_is_installed unattended-upgrades &&
@@ -599,7 +532,7 @@ show_status() {
         warn_condition "Automatic APT security-update scheduling could not be confirmed."
     fi
 
-    if reboot_is_required; then
+    if [[ -f /run/reboot-required || -f /var/run/reboot-required ]]; then
         warn_condition "Ubuntu reports that a reboot is required."
         REBOOT_RECOMMENDED=1
     else
@@ -613,28 +546,16 @@ show_status() {
     fi
 
     if command -v glxinfo >/dev/null 2>&1; then
-        local renderer
-
-        renderer="$(
-            glxinfo 2>/dev/null |
-                awk -F': ' '/OpenGL renderer string/ {print $2; exit}' || true
-        )"
-
+        renderer="$(glxinfo 2>/dev/null | awk -F': ' '/OpenGL renderer string/ {print $2; exit}' || true)"
         if [[ -n "$renderer" ]]; then
             info "Desktop renderer: ${renderer}"
         fi
     fi
 
     if command -v nvidia-smi >/dev/null 2>&1; then
-        local gpu
-
-        gpu="$(
-            nvidia-smi \
-                --query-gpu=name,driver_version,temperature.gpu,utilization.gpu,memory.used,memory.total \
-                --format=csv,noheader \
-                2>/dev/null || true
-        )"
-
+        gpu="$(nvidia-smi \
+            --query-gpu=name,driver_version,temperature.gpu,utilization.gpu,memory.used,memory.total \
+            --format=csv,noheader 2>/dev/null || true)"
         if [[ -n "$gpu" ]]; then
             info "NVIDIA: ${gpu}"
         else
@@ -644,51 +565,23 @@ show_status() {
 }
 
 offer_reboot() {
+    local status
+
     (( REBOOT_RECOMMENDED == 1 )) || return 0
 
-    if confirm "Restart the computer now?"; then
-        info "Requesting restart in 5 seconds..."
-        sleep 5
-        if run_root reboot; then
-            success "Restart request accepted."
-        else
-            local exit_code=$?
-            error "Restart request failed (exit code ${exit_code}). See the reason above and in ${LOG_FILE}."
-            return "$exit_code"
-        fi
-    else
+    if ! confirm "Restart the computer now?"; then
         info "Reboot skipped. Restart later to complete pending changes."
+        return 0
+    fi
+
+    info "Requesting restart in 5 seconds..."
+    sleep 5
+    status=0
+    run_root reboot || status=$?
+    if (( status == 0 )); then
+        success "Restart request accepted."
+    else
+        error "Restart request failed (exit code ${status}). See the reason above and in ${LOG_FILE}."
+        return "$status"
     fi
 }
-
-main() {
-    initialize_runtime "$SCRIPT_DIR" update-system 'Ubuntu system maintenance'
-    require_commands \
-        apt apt-cache apt-get apt-mark awk df dpkg dpkg-query \
-        fuser grep head mktemp sed sort systemctl tee tr uname
-    create_temp_dir
-    require_sudo
-    check_apt_locks
-    check_disk_space
-    check_dpkg_state
-    check_apt_health "before upgrades"
-    report_manual_holds
-
-    export DEBIAN_FRONTEND=noninteractive
-
-    update_apt
-    handle_phased_updates
-    handle_full_upgrade
-    check_apt_health "after upgrades"
-    audit_remaining_apt_updates
-    handle_nvidia
-    handle_firmware
-    handle_autoremove
-    update_other_packages
-    show_status
-
-    show_completion_summary
-    offer_reboot
-}
-
-main "$@"
