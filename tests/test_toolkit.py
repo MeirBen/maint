@@ -35,14 +35,15 @@ fail_helper() { run /bin/bash -c 'exit 42'; }
 
 class ToolkitTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="maintenance-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="maint-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.toolkit = self.root / "Toolkit with spaces"
-        self.hub = self.toolkit / "maintenance.sh"
+        self.hub = self.toolkit / "maint"
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        sources = [PROJECT / "maintenance.sh", PROJECT / "lib/common.sh", *PROJECT.glob("modules/*.sh")]
+        sources = [PROJECT / "maint", PROJECT / "completion.bash", PROJECT / "lib/common.sh",
+            *PROJECT.glob("modules/*.sh")]
         for source in sources:
             target = self.toolkit / source.relative_to(PROJECT)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -84,11 +85,11 @@ exit "${BROWSER_EXIT:-0}"
             "\ninitialize_runtime " + shlex.quote(tool) + ' "Test task"\n' + body + "\n")
         return path
 
-    def system_feature_probe(self, body, tool="probe"):
-        path = self.root / "system-feature-probe.sh"
+    def sys_module_probe(self, body, tool="probe"):
+        path = self.root / "sys-module-probe.sh"
         path.write_text("#!/bin/bash\nset -Eeuo pipefail\nsource " +
             shlex.quote(str(self.toolkit / "lib/common.sh")) + "\nsource " +
-            shlex.quote(str(self.toolkit / "modules/system.sh")) +
+            shlex.quote(str(self.toolkit / "modules/sys.sh")) +
             "\ninitialize_runtime " + shlex.quote(tool) + ' "Test task"\ncreate_temp_dir\n' + body + "\n")
         return path
 
@@ -96,14 +97,14 @@ exit "${BROWSER_EXIT:-0}"
         return subprocess.run(["/bin/bash", str(path), *arguments], input=input, text=True,
             capture_output=True, timeout=6, cwd=self.root, env={**self.env, **changes})
 
-    def maintenance(self, *arguments, input="", **changes):
+    def maint(self, *arguments, input="", **changes):
         return self.run_script(self.hub, *arguments, input=input, **changes)
 
     def log(self, tool="probe"):
         return (self.toolkit / "logs" / (tool + ".log")).read_text()
 
     def temporary_folders(self):
-        return list((self.toolkit / "logs").glob("maintenance.*"))
+        return list((self.toolkit / "logs").glob("maint.*"))
 
     def wait_for_lock(self, tool="probe"):
         with (self.toolkit / "logs" / ("." + tool + ".lock")).open("a") as lock:
@@ -170,7 +171,7 @@ fi
 
     def test_daily_logs_keep_every_run_and_roll_independently_for_each_tool(self):
         self.use_log_date("2026-10-08")
-        for tool in ("system", "local-ai"):
+        for tool in ("sys", "ai"):
             with self.subTest(tool=tool):
                 path = self.probe('info "Run: $1"', tool)
                 self.assertEqual(self.run_script(path, "first").returncode, 0)
@@ -195,7 +196,7 @@ fi
         history.mkdir(parents=True)
         for name in ("2026-07-10.log", "2026-07-11.log", "2026-10-08.log", "notes.txt"):
             (history/name).write_text(name + "\n")
-        other = self.toolkit / "logs/local-ai/2026-07-10.log"
+        other = self.toolkit / "logs/ai/2026-07-10.log"
         other.parent.mkdir()
         other.write_text("Other tool's log\n")
         outside = self.root / "unrelated.log"
@@ -214,12 +215,12 @@ fi
 
     def test_failed_local_ai_run_remains_available_after_a_later_success(self):
         self.use_log_date("2026-10-08")
-        failed = self.maintenance("local-ai", "update", SERVICE_EXIT="43")
+        failed = self.maint("ai", "update", SERVICE_EXIT="43")
         self.assertEqual(failed.returncode, 43, failed.stderr)
-        result = self.maintenance("local-ai", "start")
+        result = self.maint("ai", "start")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("exit code 43", self.log("local-ai"))
-        self.assertIn("Service action: start", self.log("local-ai"))
+        self.assertIn("exit code 43", self.log("ai"))
+        self.assertIn("Service action: start", self.log("ai"))
 
     def test_daily_logs_stay_private_across_privilege_modes(self):
         self.use_log_date("2026-10-08")
@@ -274,7 +275,7 @@ echo SHOULD_NOT_RUN
         lines = PROBE_MODULE.split("\n")
         call_line = 1 + next(i for i, line in enumerate(lines) if line.startswith("action_fail()"))
         run_line = 1 + next(i for i, line in enumerate(lines) if line.startswith("fail_helper()"))
-        result = self.maintenance("probe", "fail")
+        result = self.maint("probe", "fail")
         self.assertEqual(result.returncode, 42, result.stderr)
         self.assertRegex(self.log(), r"Probe fail failed with exit code 42 at: .*"
             rf"action_fail \(probe\.sh:{call_line}\) > fail_helper \(probe\.sh:{run_line}\) > "
@@ -297,19 +298,19 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
                     self.assertEqual(self.trace.read_text().splitlines()[0], "sudo:-v")
 
     def test_failed_authentication_cannot_start_a_service(self):
-        result = self.maintenance("local-ai", "update", AUTH_EXIT="41")
+        result = self.maint("ai", "update", AUTH_EXIT="41")
         self.assertEqual(result.returncode, 41, result.stderr)
         self.assertEqual(self.trace.read_text(), "sudo:-v\n")
-        self.assertIn("exit code 41", self.log("local-ai"))
+        self.assertIn("exit code 41", self.log("ai"))
 
     def test_local_ai_actions_keep_logs_in_both_privilege_modes(self):
         for uid in ("0", "1000"):
             for action in ("start", "stop", "update"):
                 with self.subTest(uid=uid, action=action):
                     self.trace.unlink(missing_ok=True)
-                    result = self.maintenance("local-ai", action, TEST_EUID=uid)
+                    result = self.maint("ai", action, TEST_EUID=uid)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    log = self.log("local-ai")
+                    log = self.log("ai")
                     self.assertIn("Service action: " + action, log)
                     self.assertIn("Service diagnostic", log)
                     self.assertIn("Total duration:", log)
@@ -319,10 +320,10 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
                     self.assertEqual("browser:" in trace, uid != "0" and action == "start")
 
     def test_service_failure_is_logged_and_returned(self):
-        result = self.maintenance("local-ai", "update", SERVICE_EXIT="43")
+        result = self.maint("ai", "update", SERVICE_EXIT="43")
         self.assertEqual(result.returncode, 43, result.stderr)
-        self.assertIn("exit code 43", self.log("local-ai"))
-        self.assertNotIn("completed successfully", self.log("local-ai"))
+        self.assertIn("exit code 43", self.log("ai"))
+        self.assertNotIn("completed successfully", self.log("ai"))
 
     def configure_local_ai_status(self):
         self.command("systemctl", '''#!/bin/bash
@@ -348,16 +349,16 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
 
     def test_local_ai_status_from_menu_and_cli_only_reads_service_state(self):
         self.configure_local_ai_status()
-        for arguments, input_text in ((["local-ai"], "4\n"), (["local-ai", "status"], "")):
+        for arguments, input_text in ((["ai"], "4\n"), (["ai", "status"], "")):
             for uid in ("0", "1000"):
                 with self.subTest(arguments=arguments, uid=uid):
                     self.trace.unlink(missing_ok=True)
-                    result = self.maintenance(*arguments, input=input_text, TEST_EUID=uid)
+                    result = self.maint(*arguments, input=input_text, TEST_EUID=uid)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     for text in ("Ollama: RUNNING", "Docker: RUNNING",
                             "Open WebUI: RUNNING (health: healthy)"):
                         self.assertIn(text, result.stdout)
-                        self.assertIn(text, self.log("local-ai"))
+                        self.assertIn(text, self.log("ai"))
                     trace = self.trace.read_text()
                     self.assertNotIn("service:", trace)
                     self.assertNotIn("browser:", trace)
@@ -369,7 +370,7 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
                 ("activating", "ACTIVATING"), ("deactivating", "DEACTIVATING"),
                 ("reloading", "RELOADING")):
             with self.subTest(state=state):
-                result = self.maintenance("local-ai", "status",
+                result = self.maint("ai", "status",
                     OLLAMA_STATE=state, CONTAINER_STATE="exited|unhealthy")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Ollama: " + expected, result.stdout)
@@ -378,7 +379,7 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
 
     def test_stopped_container_does_not_report_stale_health_as_current(self):
         self.configure_local_ai_status()
-        result = self.maintenance("local-ai", "status",
+        result = self.maint("ai", "status",
             OLLAMA_STATE="inactive", CONTAINER_STATE="exited|unhealthy")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Open WebUI: NOT RUNNING (exited)", result.stdout)
@@ -388,7 +389,7 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
 
     def test_running_unhealthy_container_produces_a_warning_summary(self):
         self.configure_local_ai_status()
-        result = self.maintenance("local-ai", "status", CONTAINER_STATE="running|unhealthy")
+        result = self.maint("ai", "status", CONTAINER_STATE="running|unhealthy")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("[WARN] Open WebUI: RUNNING (health: unhealthy)", result.stdout)
         self.assertIn("1 warning condition", result.stdout)
@@ -403,14 +404,14 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
                 ("restarting|unhealthy", "RESTARTING", True),
                 ("dead|unhealthy", "FAILED (dead)", True)):
             with self.subTest(state=state):
-                result = self.maintenance("local-ai", "status", CONTAINER_STATE=state)
+                result = self.maint("ai", "status", CONTAINER_STATE=state)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Open WebUI: " + expected, result.stdout)
                 self.assertEqual("[WARN]" in result.stdout, warning)
 
     def test_status_does_not_activate_stopped_docker_to_inspect_the_container(self):
         self.configure_local_ai_status()
-        result = self.maintenance("local-ai", "status", DOCKER_STATE="inactive")
+        result = self.maint("ai", "status", DOCKER_STATE="inactive")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Docker: NOT RUNNING", result.stdout)
         self.assertIn("Open WebUI: UNKNOWN", result.stdout)
@@ -420,53 +421,77 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
 
     def test_status_query_failures_are_logged_without_reporting_stopped(self):
         self.configure_local_ai_status()
-        result = self.maintenance("local-ai", "status", OLLAMA_STATE="unavailable", DOCKER_EXIT="1")
+        result = self.maint("ai", "status", OLLAMA_STATE="unavailable", DOCKER_EXIT="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Ollama: UNKNOWN", result.stdout)
         self.assertIn("Docker: RUNNING", result.stdout)
         self.assertIn("Open WebUI: UNKNOWN", result.stdout)
         self.assertNotIn("NOT RUNNING", result.stdout)
-        self.assertIn("Service manager unavailable", self.log("local-ai"))
-        self.assertIn("Cannot inspect container", self.log("local-ai"))
+        self.assertIn("Service manager unavailable", self.log("ai"))
+        self.assertIn("Cannot inspect container", self.log("ai"))
 
     def test_browser_failure_is_a_warning_not_a_service_failure(self):
-        result = self.maintenance("local-ai", "start", BROWSER_EXIT="7")
+        result = self.maint("ai", "start", BROWSER_EXIT="7")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("[WARN]", self.log("local-ai"))
-        self.assertIn("1 warning condition", self.log("local-ai"))
+        self.assertIn("[WARN]", self.log("ai"))
+        self.assertIn("1 warning condition", self.log("ai"))
 
     def test_menu_exit_invalid_arguments_and_eof_preserve_previous_log(self):
-        log = self.toolkit / "logs/local-ai.log"
+        log = self.toolkit / "logs/ai.log"
         log.parent.mkdir()
         log.write_text("Previous run\n")
-        for arguments, input_text, expected in (([], "0\n", 0), (["local-ai"], "0\n", 0),
-                (["local-ai"], "", 0), (["local-ai"], "9\nx\n", 0), (["unknown"], "", 2),
-                (["../lib/common"], "", 2), (["local-ai", "bogus"], "", 2),
-                (["local-ai", "start", "extra"], "", 2)):
+        for arguments, input_text, expected in (([], "0\n", 0), (["ai"], "0\n", 0),
+                (["ai"], "", 0), (["ai"], "9\nx\n", 0), (["unknown"], "", 2),
+                (["../lib/common"], "", 2), (["ai", "bogus"], "", 2),
+                (["ai", "start", "extra"], "", 2)):
             with self.subTest(arguments=arguments, input_text=input_text):
-                result = self.maintenance(*arguments, input=input_text)
+                result = self.maint(*arguments, input=input_text)
                 self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertEqual(log.read_text(), "Previous run\n")
         self.assertFalse(self.trace.exists())
 
+    def test_unknown_names_list_the_valid_choices(self):
+        for arguments, expected in (
+                (["nope"], "Unknown module 'nope'. Choose from: ai, sys."),
+                (["nope", "start"], "Unknown module 'nope'. Choose from: ai, sys."),
+                (["ai", "nope"], "Unknown action 'nope' for ai. Choose from: start, stop, update, status.")):
+            with self.subTest(arguments=arguments):
+                result = self.maint(*arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(expected, result.stderr)
+
+    def test_tab_completion_offers_modules_then_their_actions(self):
+        self.hub.chmod(0o750)
+        (self.bin / "maint").symlink_to(self.hub)
+        script = ("source " + shlex.quote(str(self.toolkit / "completion.bash")) +
+            '\nCOMP_WORDS=("$@"); COMP_CWORD=$(($# - 1)); _maint; printf "%s\\n" "${COMPREPLY[@]}"')
+        for words, expected in ((["maint", ""], ["help", "list", "ai", "sys"]),
+                (["maint", "a"], ["ai"]), (["maint", "ai", "st"], ["start", "stop", "status"]),
+                (["maint", "ai", "start", ""], [""])):
+            with self.subTest(words=words):
+                result = subprocess.run(["/bin/bash", "-c", script, "completion", *words],
+                    capture_output=True, text=True, timeout=6, env=self.env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.split("\n")[:-1], expected)
+
     def test_modules_are_discovered_and_broken_modules_are_skipped(self):
         self.add_probe_module()
         (self.toolkit / "modules/broken.sh").write_text("MODULE_TITLE='Broken'\nMODULE_ACTIONS=('go|Go')\n")
-        help_text = self.maintenance("help")
+        help_text = self.maint("help")
         self.assertEqual(help_text.returncode, 0, help_text.stderr)
-        self.assertIn("maintenance probe work", help_text.stdout)
-        self.assertIn("maintenance local-ai start", help_text.stdout)
+        self.assertIn("maint probe work", help_text.stdout)
+        self.assertIn("maint ai start", help_text.stdout)
         self.assertNotIn("broken", help_text.stdout)
         self.assertIn("Skipping module broken.sh", help_text.stderr)
-        listing = self.maintenance("list")
+        listing = self.maint("list")
         self.assertEqual(listing.returncode, 0, listing.stderr)
         self.assertIn("probe\twork\tProbe\tDo probe work\n", listing.stdout)
-        self.assertIn("local-ai\tstart\tLocal AI\t", listing.stdout)
+        self.assertIn("ai\tstart\tLocal AI\t", listing.stdout)
         self.assertNotIn("broken", listing.stdout)
-        result = self.maintenance("probe", input="1\n0\n")
+        result = self.maint("probe", input="1\n0\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("probe-work", self.log())
-        self.assertEqual(self.maintenance("broken", "go").returncode, 2)
+        self.assertEqual(self.maint("broken", "go").returncode, 2)
 
     def test_noninteractive_confirmations_default_to_no(self):
         result = self.run_script(self.probe('''
@@ -485,7 +510,7 @@ else
     printf 'apt:%s\\n' "$*" >> "$TRACE"
 fi
 ''')
-        path = self.system_feature_probe("handle_full_upgrade")
+        path = self.sys_module_probe("handle_full_upgrade")
         for response in ("\n", "apply\n", "APPLY\n"):
             with self.subTest(response=response):
                 self.trace.unlink(missing_ok=True)
@@ -499,7 +524,7 @@ fi
     def test_reboot_requires_explicit_yes(self):
         self.command("reboot", '#!/bin/sh\necho reboot >> "$TRACE"\n')
         self.command("sleep", '#!/bin/sh\nexit 0\n')
-        path = self.system_feature_probe("REBOOT_RECOMMENDED=1\noffer_reboot")
+        path = self.sys_module_probe("REBOOT_RECOMMENDED=1\noffer_reboot")
         for response in ("\n", "y\n"):
             with self.subTest(response=response):
                 self.trace.unlink(missing_ok=True)
@@ -515,7 +540,7 @@ echo 'Restart refused: an application is blocking shutdown.' >&2
 exit 42
 ''')
         self.command("sleep", '#!/bin/sh\nexit 0\n')
-        path = self.system_feature_probe("REBOOT_RECOMMENDED=1\noffer_reboot", "reboot-test")
+        path = self.sys_module_probe("REBOOT_RECOMMENDED=1\noffer_reboot", "reboot-test")
         for uid in ("0", "1000"):
             with self.subTest(uid=uid):
                 self.env["TEST_EUID"] = uid
@@ -529,7 +554,7 @@ exit 42
     def test_accepted_reboot_request_is_logged(self):
         self.command("reboot", '#!/bin/sh\nexit 0\n')
         self.command("sleep", '#!/bin/sh\nexit 0\n')
-        path = self.system_feature_probe("REBOOT_RECOMMENDED=1\noffer_reboot")
+        path = self.sys_module_probe("REBOOT_RECOMMENDED=1\noffer_reboot")
         status, output = self.terminal_run(path, replies=(("[y/N]:", "y\n"),))
         self.assertEqual(status, 0, output)
         self.assertIn("Restart request accepted", self.log())

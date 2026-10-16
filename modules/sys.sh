@@ -1,4 +1,4 @@
-# shellcheck shell=bash disable=SC2034 # MODULE_TITLE and MODULE_ACTIONS are read by maintenance.sh.
+# shellcheck shell=bash disable=SC2034 # MODULE_TITLE and MODULE_ACTIONS are read by maint.
 # Ubuntu workstation maintenance.
 # Conservative by design:
 #   - normal APT upgrades are installed automatically
@@ -7,7 +7,7 @@
 #   - package removals require stronger confirmation
 #   - firmware, autoremove, and NVIDIA branch changes require confirmation
 
-MODULE_TITLE='Ubuntu system'
+MODULE_TITLE='System'
 MODULE_ACTIONS=(
     'update|Update and clean up Ubuntu (APT, drivers, firmware, Flatpak, Snap)'
 )

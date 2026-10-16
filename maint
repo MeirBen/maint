@@ -1,26 +1,22 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Maintenance: one entry point for every module in modules/.
-#   maintenance                  menu of every action
-#   maintenance MODULE           menu of one module's actions
-#   maintenance MODULE ACTION    run one action
-#   maintenance help             list every command
-#   maintenance list             list every action as MODULE<TAB>ACTION<TAB>TITLE<TAB>DESCRIPTION
+# maint: the Maintenance command. One entry point for every module in modules/; see `maint help`.
 
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # shellcheck source=lib/common.sh
 source "${SELF%/*}/lib/common.sh"
 
-# Action registry in menu order, filled by load_modules.
+# Registry in menu order, filled by load_modules: one ENTRY_* row per action.
+MODULE_IDS=()
+declare -A MODULE_TITLES=()
 ENTRY_MODULES=()
 ENTRY_ACTIONS=()
 ENTRY_DESCRIPTIONS=()
-declare -A MODULE_TITLES=()
 
 load_modules() {
     local file id rows title action description
-    for file in "${MAINTENANCE_ROOT}"/modules/*.sh; do
+    for file in "${MAINT_ROOT}"/modules/*.sh; do
         [[ -e "$file" ]] || continue
         id="${file##*/}"
         id="${id%.sh}"
@@ -29,6 +25,7 @@ load_modules() {
             continue
         fi
         { read -r title
+          MODULE_IDS+=("$id")
           MODULE_TITLES[$id]="$title"
           while IFS='|' read -r action description; do
               ENTRY_MODULES+=("$id")
@@ -65,20 +62,43 @@ find_entry() {
     return 1
 }
 
+# Reports an unknown module, or an unknown action of MODULE, with the valid choices.
+reject() {
+    local message="$1" module="${2:-}" index choices=""
+    if [[ -z "$module" ]]; then
+        printf -v choices '%s, ' "${MODULE_IDS[@]}"
+    else
+        for index in "${!ENTRY_MODULES[@]}"; do
+            if [[ "${ENTRY_MODULES[index]}" == "$module" ]]; then
+                choices+="${ENTRY_ACTIONS[index]}, "
+            fi
+        done
+    fi
+    choices="${choices%, }"
+    printf "%s Choose from: %s. Run 'maint help' for details.\n" "$message" "${choices:-none}" >&2
+    exit 2
+}
+
 usage() {
     local index
-    echo 'Usage: maintenance [MODULE [ACTION]] | help | list'
-    echo
-    echo 'Without arguments, opens the menu. With MODULE only, opens its menu.'
-    echo 'list prints every action as tab-separated MODULE, ACTION, TITLE, DESCRIPTION.'
-    echo
+    cat <<'EOF'
+Usage: maint [MODULE [ACTION]]
+
+  maint                  Open the menu
+  maint MODULE           Open one module's menu
+  maint MODULE ACTION    Run one action
+  maint list             Print every action as tab-separated MODULE, ACTION, TITLE, DESCRIPTION
+  maint help             Show this help
+
+Actions:
+EOF
     for index in "${!ENTRY_MODULES[@]}"; do
-        printf '  %-30s %s\n' "maintenance ${ENTRY_MODULES[index]} ${ENTRY_ACTIONS[index]}" \
+        printf '  %-22s %s\n' "maint ${ENTRY_MODULES[index]} ${ENTRY_ACTIONS[index]}" \
             "${ENTRY_DESCRIPTIONS[index]}"
     done
 }
 
-# Machine-readable registry for other front ends; keep the columns stable.
+# Machine-readable registry for completion and other front ends; keep the columns stable.
 list_actions() {
     local index
     for index in "${!ENTRY_MODULES[@]}"; do
@@ -90,7 +110,7 @@ list_actions() {
 run_action() {
     local module="$1" action="$2"
     # shellcheck source=/dev/null
-    source "${MAINTENANCE_ROOT}/modules/${module}.sh"
+    source "${MAINT_ROOT}/modules/${module}.sh"
     initialize_runtime "$module" "${MODULE_TITLES[$module]} ${action}"
     "action_${action}"
 }
@@ -155,16 +175,11 @@ main() {
         1:help|1:-h|1:--help) usage ;;
         1:list) list_actions ;;
         1:*)
-            if [[ -z "${MODULE_TITLES[$1]+set}" ]]; then
-                usage >&2
-                return 2
-            fi
+            [[ -n "${MODULE_TITLES[$1]+set}" ]] || reject "Unknown module '$1'."
             run_menu "$1" ;;
         2:*)
-            if ! index="$(find_entry "$1" "$2")"; then
-                usage >&2
-                return 2
-            fi
+            [[ -n "${MODULE_TITLES[$1]+set}" ]] || reject "Unknown module '$1'."
+            index="$(find_entry "$1" "$2")" || reject "Unknown action '$2' for $1." "$1"
             run_action "${ENTRY_MODULES[index]}" "${ENTRY_ACTIONS[index]}" ;;
         *)
             usage >&2

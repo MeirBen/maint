@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Shared runtime for maintenance actions: daily logs, locking, privileges, prompts, cleanup.
+# Shared runtime for maint actions: daily logs, locking, privileges, prompts, cleanup.
 
-MAINTENANCE_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+MAINT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Starts an action run: takes the per-tool lock, opens today's log, installs traps.
 initialize_runtime() {
     local tool="$1" run_day lock_file
     TASK_LABEL="$2"
-    LOG_DIR="${MAINTENANCE_ROOT}/logs"
+    LOG_DIR="${MAINT_ROOT}/logs"
     LOG_FILE="${LOG_DIR}/${tool}.log"
     TMP_DIR=""
     WARNING_COUNT=0
@@ -27,7 +27,7 @@ initialize_runtime() {
     lock_file="${LOG_DIR}/.${tool}.lock"
     exec 9>>"$lock_file"
     if (( EUID == 0 )); then
-        chown --reference="$MAINTENANCE_ROOT" -- "$LOG_DIR" "$lock_file"
+        chown --reference="$MAINT_ROOT" -- "$LOG_DIR" "$lock_file"
     fi
     if ! flock --wait 180 9; then
         printf 'Another %s run is still active. Please try again.\n' "$TASK_LABEL" >&2
@@ -53,7 +53,7 @@ prepare_daily_log() {
     mkdir -p -- "$history_dir"
     : >> "$daily_log"
     if (( EUID == 0 )); then
-        chown --reference="$MAINTENANCE_ROOT" -- "$history_dir" "$daily_log"
+        chown --reference="$MAINT_ROOT" -- "$history_dir" "$daily_log"
     fi
     ln -sfnT -- "${tool}/${day}.log" "$LOG_FILE"
 
@@ -158,7 +158,7 @@ confirm_phrase() {
 }
 
 create_temp_dir() {
-    TMP_DIR="$(mktemp -d "${LOG_DIR}/maintenance.XXXXXX")"
+    TMP_DIR="$(mktemp -d "${LOG_DIR}/maint.XXXXXX")"
 }
 
 # Logs the failing call chain, e.g. "action_update (system.sh:33) > run (common.sh:113)".
