@@ -39,6 +39,15 @@ Run them as your own user; they ask for sudo only to change `/usr/local/bin`. Op
 
 Local AI actions call `/usr/local/sbin/local-ai-service-control` and `/usr/local/libexec/local-ai-update.py`, which are installed separately from this repository.
 
+## Configure
+
+- **Disable a module:** rename it so it no longer ends in `.sh`, for example `mv modules/ai.sh modules/ai.sh.off`. It disappears from the menu, `maint help`, `maint list`, and Tab completion at once; rename it back to enable it. To remove it for good, delete the file.
+- **Module settings** sit in a `# Settings.` block at the top of each module: `MIN_ROOT_FREE_GIB` in `modules/sys.sh`; `SERVICE_CONTROL`, `DOCKER`, `CONTAINER`, and `CHAT_URL` in `modules/ai.sh`.
+- **Shared settings** sit at the top of `lib/common.sh`: `LOG_RETENTION_DAYS` and `LOCK_WAIT_SECONDS`.
+- **Menu text** is the `MODULE_TITLE` and the `MODULE_ACTIONS` descriptions of each module.
+
+Changes apply on the next run; nothing needs reinstalling.
+
 ## Adding a module
 
 Drop a file such as `modules/disk.sh` into `modules/`. Its name is the module name, and it only defines variables and functions:
@@ -55,11 +64,12 @@ MODULE_ACTIONS=(
 action_trim() {
     require_sudo
     run_root fstrim --all --verbose
-    show_completion_summary
 }
 ```
 
-Each `name|description` entry needs an `action_<name>` function. The menu, `maint help`, `maint list`, Tab completion, and `maint disk trim` pick it up automatically; a module that fails to load is skipped with a message. Actions use the helpers in `lib/common.sh`: `info`, `success`, `warn_condition`, `warn_note`, `error`, `run`, `run_root`, `as_root`, `require_sudo`, `require_commands`, `confirm`, `confirm_phrase`, `create_temp_dir`, and `show_completion_summary`. Any failing command stops the action and is logged with its call chain. A running action shares its namespace with `maint` and `lib/common.sh`, so modules must not redefine their functions (such as `main`, `usage`, `run_action`, or `info`).
+Each `name|description` entry needs an `action_<name>` function. The menu, `maint help`, `maint list`, Tab completion, and `maint disk trim` pick it up automatically; a module that fails to load is skipped with a message.
+
+Each action runs in its own process, `lib/run.sh`, with only `lib/common.sh` and its own module loaded. Actions use these helpers and must not redefine them: `info`, `success`, `warn_condition`, `warn_note`, `error`, `run`, `run_root`, `as_root`, `require_sudo`, `require_commands`, `confirm`, `confirm_phrase`, `create_temp_dir`, and `show_completion_summary`. Any failing command stops the action and is logged with its call chain. After an action succeeds, its summary of warnings and duration is logged automatically; call `show_completion_summary` yourself only to log it earlier, as `modules/sys.sh` does before offering a reboot.
 
 ## Front ends
 
@@ -73,7 +83,8 @@ The terminal menu is one front end. Another, such as a desktop UI, can drive the
 ## Files
 
 - `maint` — command line, menu, and module registry.
-- `lib/common.sh` — logging, locking, privileges, prompts, and cleanup for each action run.
+- `lib/run.sh` — runs one action in its own process.
+- `lib/common.sh` — settings, logging, locking, privileges, prompts, and cleanup for each action run.
 - `modules/` — one file per module: `sys.sh` (System) and `ai.sh` (Local AI).
 - `completion.bash` — Tab completion, read from `maint list`.
 - `install.sh`, `uninstall.sh`, `icons/` — command, completion, and desktop launcher setup.
@@ -81,19 +92,19 @@ The terminal menu is one front end. Another, such as a desktop UI, can drive the
 
 ## Logs
 
-Each module writes to `logs/<module>/YYYY-MM-DD.log`, keeping today and the previous 89 days; `logs/<module>.log` links to today's file. Every run starts with a `=====` header naming the action, user, and process ID, and failures or interruptions are logged with their cause. Only one run of each module proceeds at a time; another waits up to 180 seconds.
+Each module writes to `logs/<module>/YYYY-MM-DD.log`, keeping `LOG_RETENTION_DAYS` days (90) including today; `logs/<module>.log` links to today's file. Every run starts with a `=====` header naming the action, user, and process ID, and failures or interruptions are logged with their cause. Only one run of each module proceeds at a time; another says it is waiting and waits up to `LOCK_WAIT_SECONDS` (180).
 
 ## Checks
 
 From the repository root:
 
 ```bash
-for file in maint lib/common.sh modules/*.sh completion.bash install.sh uninstall.sh; do bash -n "$file"; done
+for file in maint lib/*.sh modules/*.sh completion.bash install.sh uninstall.sh; do bash -n "$file"; done
 python3 -B -m unittest discover -s tests -p 'test_*.py'
 ```
 
 Tests use temporary files and fake system commands; they do not install updates or change services. Lint, if ShellCheck is installed (expected output: none):
 
 ```bash
-shellcheck -x -P SCRIPTDIR maint lib/common.sh modules/*.sh completion.bash install.sh uninstall.sh
+shellcheck -x -P SCRIPTDIR maint lib/*.sh modules/*.sh completion.bash install.sh uninstall.sh
 ```

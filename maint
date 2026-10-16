@@ -3,9 +3,9 @@ set -Eeuo pipefail
 
 # maint: the Maintenance command. One entry point for every module in modules/; see `maint help`.
 
-SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
-# shellcheck source=lib/common.sh
-source "${SELF%/*}/lib/common.sh"
+MAINT_ROOT="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
+# Actions run in this separate process; the menu and command line never load lib/common.sh.
+RUNNER="${MAINT_ROOT}/lib/run.sh"
 
 # Registry in menu order, filled by load_modules: one ENTRY_* row per action.
 MODULE_IDS=()
@@ -50,12 +50,10 @@ describe_module() (
     done
 )
 
-# Prints the registry index of MODULE ACTION, or fails when it is not registered.
-find_entry() {
+is_registered() {
     local index
     for index in "${!ENTRY_MODULES[@]}"; do
         if [[ "${ENTRY_MODULES[index]}" == "$1" && "${ENTRY_ACTIONS[index]}" == "$2" ]]; then
-            printf '%s\n' "$index"
             return 0
         fi
     done
@@ -107,15 +105,7 @@ list_actions() {
     done
 }
 
-run_action() {
-    local module="$1" action="$2"
-    # shellcheck source=/dev/null
-    source "${MAINT_ROOT}/modules/${module}.sh"
-    initialize_runtime "$module" "${MODULE_TITLES[$module]} ${action}"
-    "action_${action}"
-}
-
-# Each choice runs in a child process, so its lock, traps, and temporary files
+# Each choice runs in its own runner process, so its lock, traps, and temporary files
 # are released before the menu returns.
 run_menu() {
     local module_filter="${1:-}" index position choice status module
@@ -156,7 +146,7 @@ run_menu() {
 
         index="${choices[choice - 1]}"
         status=0
-        "$BASH" "$SELF" "${ENTRY_MODULES[index]}" "${ENTRY_ACTIONS[index]}" || status=$?
+        "$BASH" "$RUNNER" "${ENTRY_MODULES[index]}" "${ENTRY_ACTIONS[index]}" || status=$?
         case "$status" in
             129|130|143) return "$status" ;;
         esac
@@ -168,7 +158,6 @@ run_menu() {
 }
 
 main() {
-    local index
     load_modules
     case "$#:${1:-}" in
         0:) run_menu ;;
@@ -179,8 +168,8 @@ main() {
             run_menu "$1" ;;
         2:*)
             [[ -n "${MODULE_TITLES[$1]+set}" ]] || reject "Unknown module '$1'."
-            index="$(find_entry "$1" "$2")" || reject "Unknown action '$2' for $1." "$1"
-            run_action "${ENTRY_MODULES[index]}" "${ENTRY_ACTIONS[index]}" ;;
+            is_registered "$1" "$2" || reject "Unknown action '$2' for $1." "$1"
+            exec "$BASH" "$RUNNER" "$1" "$2" ;;
         *)
             usage >&2
             return 2 ;;

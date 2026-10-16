@@ -17,7 +17,8 @@ PROJECT = Path(__file__).resolve().parents[1]
 
 PROBE_MODULE = '''
 MODULE_TITLE='Probe'
-MODULE_ACTIONS=('work|Do probe work' 'wait|Wait for a signal' 'fail|Fail in a helper')
+MODULE_ACTIONS=('work|Do probe work' 'wait|Wait for a signal' 'fail|Fail in a helper'
+    'early|Summarize early')
 action_work() {
     create_temp_dir
     info 'probe-work'
@@ -30,6 +31,7 @@ action_wait() {
 }
 action_fail() { fail_helper; }
 fail_helper() { run /bin/bash -c 'exit 42'; }
+action_early() { show_completion_summary; info after-summary; }
 '''
 
 
@@ -42,7 +44,7 @@ class ToolkitTests(unittest.TestCase):
         self.hub = self.toolkit / "maint"
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        sources = [PROJECT / "maint", PROJECT / "completion.bash", PROJECT / "lib/common.sh",
+        sources = [PROJECT / "maint", PROJECT / "completion.bash", *PROJECT.glob("lib/*.sh"),
             *PROJECT.glob("modules/*.sh")]
         for source in sources:
             target = self.toolkit / source.relative_to(PROJECT)
@@ -277,7 +279,7 @@ echo SHOULD_NOT_RUN
         run_line = 1 + next(i for i, line in enumerate(lines) if line.startswith("fail_helper()"))
         result = self.maint("probe", "fail")
         self.assertEqual(result.returncode, 42, result.stderr)
-        self.assertRegex(self.log(), r"Probe fail failed with exit code 42 at: .*"
+        self.assertRegex(self.log(), r"Probe fail failed with exit code 42 at: "
             rf"action_fail \(probe\.sh:{call_line}\) > fail_helper \(probe\.sh:{run_line}\) > "
             r"run \(common\.sh:\d+\)")
 
@@ -318,6 +320,13 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
                     self.assertIn("service:" + action, trace)
                     self.assertEqual("sudo:" in trace, uid != "0")
                     self.assertEqual("browser:" in trace, uid != "0" and action == "start")
+
+    def test_missing_service_helper_fails_clearly_before_asking_for_sudo(self):
+        (self.bin / "service").unlink()
+        result = self.maint("ai", "start")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Required command is missing: " + str(self.bin / "service"), self.log("ai"))
+        self.assertFalse(self.trace.exists())
 
     def test_service_failure_is_logged_and_returned(self):
         result = self.maint("ai", "update", SERVICE_EXIT="43")
@@ -493,6 +502,20 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
         self.assertIn("probe-work", self.log())
         self.assertEqual(self.maint("broken", "go").returncode, 2)
 
+    def test_runner_summarizes_each_action_exactly_once(self):
+        self.add_probe_module()
+        for action, expected_tail in (("work", "probe-work"), ("early", "after-summary")):
+            with self.subTest(action=action):
+                (self.toolkit / "logs/probe.log").unlink(missing_ok=True)
+                for path in (self.toolkit / "logs/probe").glob("*.log"):
+                    path.unlink()
+                result = self.maint("probe", action)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                log = self.log()
+                self.assertEqual(log.count("completed successfully"), 1, log)
+                self.assertEqual(log.count("Total duration:"), 1, log)
+                self.assertIn(expected_tail, log)
+
     def test_noninteractive_confirmations_default_to_no(self):
         result = self.run_script(self.probe('''
 if confirm 'Apply?'; then exit 91; fi
@@ -520,6 +543,19 @@ fi
                     self.assertIn("apt:dist-upgrade -y", self.trace.read_text())
                 else:
                     self.assertFalse(self.trace.exists(), output)
+
+    def test_disk_space_check_stops_below_the_configured_minimum(self):
+        self.command("df", '''#!/bin/bash
+if [[ "$1" == --output=avail ]]; then printf 'Avail\\n%s\\n' "$AVAIL_KIB"
+else printf 'Filesystem Size Used Avail Use%% Mounted\\n/dev/x 9G 8G 1G 90%% /\\n'; fi
+''')
+        path = self.sys_module_probe("check_disk_space")
+        for available_kib, status, message in ((1024 * 1024, 1, "Less than 2 GiB is free"),
+                (3 * 1024 * 1024, 0, "Disk-space check passed.")):
+            with self.subTest(available_kib=available_kib):
+                result = self.run_script(path, AVAIL_KIB=str(available_kib))
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertIn(message, self.log())
 
     def test_reboot_requires_explicit_yes(self):
         self.command("reboot", '#!/bin/sh\necho reboot >> "$TRACE"\n')
@@ -595,9 +631,9 @@ exit 42
                     return "\n"
 
                 result, output = self.terminal_run(self.hub, "probe", replies=(
-                    ("Choose [0-3]:", "1\n"),
+                    ("Choose [0-4]:", "1\n"),
                     ("Press Enter to return to the menu", check_released),
-                    ("Choose [0-3]:", "0\n")))
+                    ("Choose [0-4]:", "0\n")))
                 self.assertEqual(result, 0, output)
                 self.assertEqual(second_run[0].returncode, 0, second_run[0].stderr)
                 self.assertIn("probe-work", output)
@@ -617,7 +653,7 @@ exit 42
         for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             with self.subTest(signal_number=signal_number):
                 status, output = self.terminal_run(self.hub, "probe",
-                    replies=(("Choose [0-3]:", "2\n"),), interrupt=signal_number)
+                    replies=(("Choose [0-4]:", "2\n"),), interrupt=signal_number)
                 self.assertEqual(status, 128 + signal_number, output)
                 self.assertNotIn("Press Enter", output)
                 self.wait_for_lock()
@@ -662,7 +698,9 @@ if confirm_phrase 'Remove?' 'APPLY'; then info removal-approved; else info remov
             self.assertNotIn("second-run", self.log())
             release.touch()
             self.assertEqual(process.wait(timeout=3), 0)
-            self.assertEqual(second.wait(timeout=3), 0)
+            _, second_errors = second.communicate(timeout=3)
+            self.assertEqual(second.returncode, 0, second_errors)
+            self.assertIn("Waiting up to 180 seconds for another Test task run to finish", second_errors)
             self.assertIn("second-run", self.log())
             self.assertIn("first-run", self.log())
         finally:

@@ -9,6 +9,10 @@ MODULE_ACTIONS=(
     'status|Show Ollama, Docker, and Open WebUI status'
 )
 
+# Settings.
+SERVICE_CONTROL=/usr/local/sbin/local-ai-service-control   # Root helper: start|stop|update.
+DOCKER=(/usr/bin/docker --host unix:///var/run/docker.sock)
+CONTAINER=open-webui
 CHAT_URL='http://127.0.0.1:8080'
 
 action_start() {
@@ -16,33 +20,26 @@ action_start() {
     control_services start
     success "Local AI is ready at ${CHAT_URL}"
     open_chat
-    show_completion_summary
 }
 
 action_stop() {
     info 'Stopping Open WebUI and Ollama. Any active reply will stop.'
     control_services stop
     success 'Both services are stopped. Your conversations and downloaded model are saved.'
-    show_completion_summary
 }
 
 action_update() {
     info 'Checking for stable updates to Ollama, Phi, and Open WebUI…'
     control_services update
-    show_completion_summary
-}
-
-action_status() {
-    show_status
-    show_completion_summary
 }
 
 control_services() {
+    require_commands "$SERVICE_CONTROL"
     require_sudo
-    run_root /usr/local/sbin/local-ai-service-control "$1"
+    run_root "$SERVICE_CONTROL" "$1"
 }
 
-show_status() {
+action_status() {
     local service state docker_state="unknown" container_details container_state health_state
     info 'Checking current Local AI service status…'
     for service in ollama docker; do
@@ -70,10 +67,9 @@ show_status() {
     fi
 
     require_sudo
-    if container_details="$(as_root /usr/bin/docker --host unix:///var/run/docker.sock \
-        inspect --type container --format \
+    if container_details="$(as_root "${DOCKER[@]}" inspect --type container --format \
         '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
-        open-webui 2>> "$LOG_FILE")"; then
+        "$CONTAINER" 2>> "$LOG_FILE")"; then
         IFS='|' read -r container_state health_state <<< "$container_details"
         case "$container_state" in
             running)

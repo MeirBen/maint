@@ -3,6 +3,10 @@
 
 MAINT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Settings.
+LOG_RETENTION_DAYS=90    # Daily logs kept per module, today included.
+LOCK_WAIT_SECONDS=180    # How long a run waits for another run of the same module.
+
 # Starts an action run: takes the per-tool lock, opens today's log, installs traps.
 initialize_runtime() {
     local tool="$1" run_day lock_file
@@ -14,6 +18,7 @@ initialize_runtime() {
     START_TIME=$SECONDS
     COLOR_ENABLED=0
     INTERRUPTED_BY=""
+    SUMMARY_SHOWN=0
 
     umask 077
     export LC_ALL=C
@@ -25,13 +30,18 @@ initialize_runtime() {
     # Lock a stable file: the current-log link changes when the day changes.
     mkdir -p -- "$LOG_DIR"
     lock_file="${LOG_DIR}/.${tool}.lock"
-    exec 9>>"$lock_file"
+    exec {LOCK_FD}>>"$lock_file"
     if (( EUID == 0 )); then
         chown --reference="$MAINT_ROOT" -- "$LOG_DIR" "$lock_file"
     fi
-    if ! flock --wait 180 9; then
-        printf 'Another %s run is still active. Please try again.\n' "$TASK_LABEL" >&2
-        return 1
+    # Report the wait on the terminal only: the other run is still writing the log.
+    if ! flock --nonblock "$LOCK_FD"; then
+        printf 'Waiting up to %s seconds for another %s run to finish...\n' \
+            "$LOCK_WAIT_SECONDS" "$TASK_LABEL" >&2
+        if ! flock --wait "$LOCK_WAIT_SECONDS" "$LOCK_FD"; then
+            printf 'Another %s run is still active. Please try again.\n' "$TASK_LABEL" >&2
+            return 1
+        fi
     fi
 
     trap 'on_error "$?" "$LINENO"' ERR
@@ -47,8 +57,8 @@ initialize_runtime() {
 
 prepare_daily_log() {
     local tool="$1" day="$2" history_dir="${LOG_DIR}/$1" cutoff daily_log path name
-    # Today plus the preceding 89 calendar days, independent of DST changes.
-    cutoff="$(date --date="${day} 12:00:00 89 days ago" +%F)"
+    # Calendar days counted from noon, independent of DST changes.
+    cutoff="$(date --date="${day} 12:00:00 $((LOG_RETENTION_DAYS - 1)) days ago" +%F)"
     daily_log="${history_dir}/${day}.log"
     mkdir -p -- "$history_dir"
     : >> "$daily_log"
@@ -192,8 +202,14 @@ on_exit() {
     exit "$status"
 }
 
+# Logs the warning count and duration once per run. The runner calls it after each successful
+# action, so an action calls it only to log the summary earlier.
 show_completion_summary() {
     local duration=$((SECONDS - START_TIME)) warning_label
+    if (( SUMMARY_SHOWN )); then
+        return 0
+    fi
+    SUMMARY_SHOWN=1
     if (( WARNING_COUNT == 0 )); then
         success "${TASK_LABEL} completed successfully with no warning conditions."
     else

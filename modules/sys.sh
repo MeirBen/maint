@@ -12,9 +12,11 @@ MODULE_ACTIONS=(
     'update|Update and clean up Ubuntu (APT, drivers, firmware, Flatpak, Snap)'
 )
 
-REBOOT_RECOMMENDED=0
+# Settings.
+MIN_ROOT_FREE_GIB=2    # Free space required on / before upgrading.
+
 PHASED_OPTION="APT::Get::Always-Include-Phased-Updates=true"
-MIN_ROOT_FREE_KIB=$((2 * 1024 * 1024)) # 2 GiB
+REBOOT_RECOMMENDED=0
 
 action_update() {
     require_commands \
@@ -41,6 +43,7 @@ action_update() {
     update_other_packages
     show_status
 
+    # Summarize before the reboot prompt; the runner's later call then logs nothing.
     show_completion_summary
     offer_reboot
 }
@@ -93,8 +96,8 @@ check_disk_space() {
 
     info "Root filesystem free space: ${available_human}"
 
-    if [[ "$available_kib" =~ ^[0-9]+$ ]] && (( available_kib < MIN_ROOT_FREE_KIB )); then
-        error "Less than 2 GiB is free on the root filesystem."
+    if [[ "$available_kib" =~ ^[0-9]+$ ]] && (( available_kib < MIN_ROOT_FREE_GIB * 1024 * 1024 )); then
+        error "Less than ${MIN_ROOT_FREE_GIB} GiB is free on the root filesystem."
         return 1
     fi
 
