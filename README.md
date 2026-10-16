@@ -24,13 +24,14 @@ maintenance help               # List every command
 - Status only reads service state and never starts services. It reports `UNKNOWN` when Docker is stopped or a query fails, and shows container health only while Open WebUI is running.
 - Ctrl+C, closing the terminal, or `SIGTERM` stops the running action, cleans up, and exits the menu.
 
-## Install
+## Install and uninstall
 
 ```bash
-./install.sh
+./install.sh      # Links /usr/local/bin/maintenance and creates the Maintenance desktop launcher
+./uninstall.sh    # Removes both
 ```
 
-Run it as your own user; it asks for sudo only to link `/usr/local/bin/maintenance`. It also creates the trusted `Maintenance` launcher on the desktop. Re-run it after moving this folder.
+Run them as your own user; they ask for sudo only to change `/usr/local/bin`. Re-run `install.sh` after moving this folder. Uninstalling keeps `logs/`; delete this folder to remove everything.
 
 Local AI actions call `/usr/local/sbin/local-ai-service-control` and `/usr/local/libexec/local-ai-update.py`, which are installed separately from this repository.
 
@@ -59,7 +60,7 @@ Each `name|description` entry needs an `action_<name>` function. The menu, `help
 - `maintenance.sh` — command line, menu, and module registry.
 - `lib/common.sh` — logging, locking, privileges, prompts, and cleanup for each action run.
 - `modules/` — one file per feature area.
-- `install.sh`, `icons/` — command link and desktop launcher.
+- `install.sh`, `uninstall.sh`, `icons/` — command link and desktop launcher.
 - `tests/test_toolkit.py` — isolated regression tests.
 
 ## Logs
@@ -71,12 +72,12 @@ Each module writes to `logs/<module>/YYYY-MM-DD.log`, keeping today and the prev
 From the repository root:
 
 ```bash
-for file in maintenance.sh lib/common.sh modules/*.sh install.sh; do bash -n "$file"; done
+for file in maintenance.sh lib/common.sh modules/*.sh install.sh uninstall.sh; do bash -n "$file"; done
 python3 -B -m unittest discover -s tests -p 'test_*.py'
 ```
 
 Tests use temporary files and fake system commands; they do not install updates or change services. Optional lint, if ShellCheck is installed:
 
 ```bash
-shellcheck -x -P SCRIPTDIR maintenance.sh lib/common.sh modules/*.sh install.sh
+shellcheck -x -P SCRIPTDIR maintenance.sh lib/common.sh modules/*.sh install.sh uninstall.sh
 ```
