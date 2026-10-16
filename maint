@@ -38,12 +38,13 @@ load_modules() {
 }
 
 # Prints the module's title, then one "action|description" row per action.
-# The subshell keeps modules from seeing or overriding each other.
+# The subshell keeps modules from seeing or overriding each other; discarding what a module
+# prints while loading keeps the rows intact.
 describe_module() (
     local row
     # shellcheck source=/dev/null
-    source "$1" || exit 1
-    [[ -n "${MODULE_TITLE:-}" ]] && (( ${#MODULE_ACTIONS[@]} )) || exit 1
+    source "$1" > /dev/null || exit 1
+    [[ -n "${MODULE_TITLE:-}" && -n "${MODULE_ACTIONS[*]:-}" ]] || exit 1
     printf '%s\n' "$MODULE_TITLE"
     for row in "${MODULE_ACTIONS[@]}"; do
         declare -F "action_${row%%|*}" > /dev/null || exit 1

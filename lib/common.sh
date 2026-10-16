@@ -19,6 +19,7 @@ initialize_runtime() {
     COLOR_ENABLED=0
     INTERRUPTED_BY=""
     SUMMARY_SHOWN=0
+    FAILURE_LOGGED=0
 
     umask 077
     export LC_ALL=C
@@ -172,10 +173,11 @@ create_temp_dir() {
 }
 
 # Logs the failing call chain, for example
-# "action_trim (disk.sh:11) > run_root (common.sh:131) > run (common.sh:116)".
+# "action_trim (disk.sh:11) > run_root (common.sh:132) > run (common.sh:117)".
 on_error() {
     local status="$1" line="$2" frame last=$(( ${#FUNCNAME[@]} - 1 )) trace=""
     trap - ERR
+    FAILURE_LOGGED=1
     # Frame 0 is on_error itself; the last frame is the script body, shown only when it failed there.
     if (( last > 1 )); then last=$(( last - 1 )); fi
     for (( frame = 1; frame <= last; frame++ )); do
@@ -195,6 +197,9 @@ on_exit() {
     trap '' HUP INT TERM
     if [[ -n "$INTERRUPTED_BY" ]]; then
         error "${TASK_LABEL} was interrupted (${INTERRUPTED_BY}). See the log: ${LOG_FILE}" || true
+    elif (( status != 0 && ! FAILURE_LOGGED )); then
+        # An unset variable or a bare exit fails without a failing command, so on_error never ran.
+        error "${TASK_LABEL} failed with exit code ${status}. See the log: ${LOG_FILE}" || true
     fi
     if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && ! rm -rf -- "$TMP_DIR"; then
         error "Could not remove temporary folder: ${TMP_DIR}" || true

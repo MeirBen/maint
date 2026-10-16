@@ -35,19 +35,19 @@ action_early() { show_completion_summary; info after-summary; }
 '''
 
 
-class ToolkitTests(unittest.TestCase):
+class MaintTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="maint-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.toolkit = self.root / "Toolkit with spaces"
-        self.hub = self.toolkit / "maint"
+        self.maint_root = self.root / "maint with spaces"
+        self.entry_point = self.maint_root / "maint"
         self.bin = self.root / "bin"
         self.bin.mkdir()
         sources = [PROJECT / "maint", PROJECT / "completion.bash", *PROJECT.glob("lib/*.sh"),
             *PROJECT.glob("modules/*.sh")]
         for source in sources:
-            target = self.toolkit / source.relative_to(PROJECT)
+            target = self.maint_root / source.relative_to(PROJECT)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(source.read_text().replace("EUID", "TEST_EUID")
                 .replace("/usr/local/sbin/local-ai-service-control", str(self.bin / "service"))
@@ -78,21 +78,21 @@ exit "${BROWSER_EXIT:-0}"
         path.chmod(0o750)
 
     def add_probe_module(self):
-        (self.toolkit / "modules/probe.sh").write_text(PROBE_MODULE)
+        (self.maint_root / "modules/probe.sh").write_text(PROBE_MODULE)
 
-    def probe(self, body, tool="probe"):
-        path = self.root / (tool + "-probe.sh")
+    def probe(self, body, module="probe"):
+        path = self.root / (module + "-probe.sh")
         path.write_text("#!/bin/bash\nset -Eeuo pipefail\nsource " +
-            shlex.quote(str(self.toolkit / "lib/common.sh")) +
-            "\ninitialize_runtime " + shlex.quote(tool) + ' "Test task"\n' + body + "\n")
+            shlex.quote(str(self.maint_root / "lib/common.sh")) +
+            "\ninitialize_runtime " + shlex.quote(module) + ' "Test task"\n' + body + "\n")
         return path
 
-    def sys_module_probe(self, body, tool="probe"):
+    def sys_module_probe(self, body, module="probe"):
         path = self.root / "sys-module-probe.sh"
         path.write_text("#!/bin/bash\nset -Eeuo pipefail\nsource " +
-            shlex.quote(str(self.toolkit / "lib/common.sh")) + "\nsource " +
-            shlex.quote(str(self.toolkit / "modules/sys.sh")) +
-            "\ninitialize_runtime " + shlex.quote(tool) + ' "Test task"\ncreate_temp_dir\n' + body + "\n")
+            shlex.quote(str(self.maint_root / "lib/common.sh")) + "\nsource " +
+            shlex.quote(str(self.maint_root / "modules/sys.sh")) +
+            "\ninitialize_runtime " + shlex.quote(module) + ' "Test task"\ncreate_temp_dir\n' + body + "\n")
         return path
 
     def run_script(self, path, *arguments, input="", **changes):
@@ -100,16 +100,16 @@ exit "${BROWSER_EXIT:-0}"
             capture_output=True, timeout=6, cwd=self.root, env={**self.env, **changes})
 
     def maint(self, *arguments, input="", **changes):
-        return self.run_script(self.hub, *arguments, input=input, **changes)
+        return self.run_script(self.entry_point, *arguments, input=input, **changes)
 
-    def log(self, tool="probe"):
-        return (self.toolkit / "logs" / (tool + ".log")).read_text()
+    def log(self, module="probe"):
+        return (self.maint_root / "logs" / (module + ".log")).read_text()
 
     def temporary_folders(self):
-        return list((self.toolkit / "logs").glob("maint.*"))
+        return list((self.maint_root / "logs").glob("maint.*"))
 
-    def wait_for_lock(self, tool="probe"):
-        with (self.toolkit / "logs" / ("." + tool + ".lock")).open("a") as lock:
+    def wait_for_lock(self, module="probe"):
+        with (self.maint_root / "logs" / ("." + module + ".lock")).open("a") as lock:
             deadline = time.monotonic() + 3
             while True:
                 try:
@@ -171,15 +171,15 @@ fi
             process.wait()
             os.close(master)
 
-    def test_daily_logs_keep_every_run_and_roll_independently_for_each_tool(self):
+    def test_daily_logs_keep_every_run_and_roll_independently_for_each_module(self):
         self.use_log_date("2026-10-08")
-        for tool in ("sys", "ai"):
-            with self.subTest(tool=tool):
-                path = self.probe('info "Run: $1"', tool)
+        for module in ("sys", "ai"):
+            with self.subTest(module=module):
+                path = self.probe('info "Run: $1"', module)
                 self.assertEqual(self.run_script(path, "first").returncode, 0)
                 self.assertEqual(self.run_script(path, "second").returncode, 0)
-                latest = self.toolkit / "logs" / (tool + ".log")
-                day_one = self.toolkit / "logs" / tool / "2026-10-08.log"
+                latest = self.maint_root / "logs" / (module + ".log")
+                day_one = self.maint_root / "logs" / module / "2026-10-08.log"
                 self.assertTrue(latest.is_symlink())
                 self.assertEqual(latest.resolve(), day_one)
                 original = day_one.read_text()
@@ -188,19 +188,19 @@ fi
                 result = self.run_script(path, "third", LOG_TEST_DATE="2026-10-09")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(day_one.read_text(), original)
-                self.assertIn("Run: third", self.log(tool))
-                self.assertNotIn("Run: first", self.log(tool))
+                self.assertIn("Run: third", self.log(module))
+                self.assertNotIn("Run: first", self.log(module))
                 self.assertEqual(latest.resolve().name, "2026-10-09.log")
 
     def test_retention_keeps_ninety_calendar_days_and_only_deletes_owned_log_files(self):
         self.use_log_date("2026-10-08")
-        history = self.toolkit / "logs/probe"
+        history = self.maint_root / "logs/probe"
         history.mkdir(parents=True)
         for name in ("2026-07-10.log", "2026-07-11.log", "2026-10-08.log", "notes.txt"):
             (history/name).write_text(name + "\n")
-        other = self.toolkit / "logs/ai/2026-07-10.log"
+        other = self.maint_root / "logs/ai/2026-07-10.log"
         other.parent.mkdir()
-        other.write_text("Other tool's log\n")
+        other.write_text("Other module's log\n")
         outside = self.root / "unrelated.log"
         outside.write_text("Keep me\n")
         link = history / "2026-07-09.log"
@@ -230,7 +230,7 @@ fi
         for uid in ("0", "1000"):
             result = self.run_script(path, TEST_EUID=uid)
             self.assertEqual(result.returncode, 0, result.stderr)
-        history = self.toolkit / "logs/probe"
+        history = self.maint_root / "logs/probe"
         self.assertTrue(history.is_dir())
         self.assertEqual(history.stat().st_mode & 0o777, 0o700)
         self.assertEqual((history/"2026-10-08.log").stat().st_mode & 0o777, 0o600)
@@ -282,6 +282,16 @@ echo SHOULD_NOT_RUN
         self.assertRegex(self.log(), r"Probe fail failed with exit code 42 at: "
             rf"action_fail \(probe\.sh:{call_line}\) > fail_helper \(probe\.sh:{run_line}\) > "
             r"run \(common\.sh:\d+\)")
+
+    def test_failures_outside_commands_are_logged_once(self):
+        for module, body, status in (("unset", 'info "value: ${NOT_SET}"', 1), ("exit", "exit 3", 3),
+                ("command", "run /bin/bash -c 'exit 42'", 42)):
+            with self.subTest(module=module):
+                result = self.run_script(self.probe(body, module))
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(self.log(module).count("Test task failed with exit code"), 1,
+                    self.log(module))
+                self.assertIn(f"failed with exit code {status}", self.log(module))
 
     def test_sudo_validation_and_argument_forwarding(self):
         path = self.probe('''
@@ -446,7 +456,7 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
         self.assertIn("1 warning condition", self.log("ai"))
 
     def test_menu_exit_invalid_arguments_and_eof_preserve_previous_log(self):
-        log = self.toolkit / "logs/ai.log"
+        log = self.maint_root / "logs/ai.log"
         log.parent.mkdir()
         log.write_text("Previous run\n")
         for arguments, input_text, expected in (([], "0\n", 0), (["ai"], "0\n", 0),
@@ -470,9 +480,9 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
                 self.assertIn(expected, result.stderr)
 
     def test_tab_completion_offers_modules_then_their_actions(self):
-        self.hub.chmod(0o750)
-        (self.bin / "maint").symlink_to(self.hub)
-        script = ("source " + shlex.quote(str(self.toolkit / "completion.bash")) +
+        self.entry_point.chmod(0o750)
+        (self.bin / "maint").symlink_to(self.entry_point)
+        script = ("source " + shlex.quote(str(self.maint_root / "completion.bash")) +
             '\nCOMP_WORDS=("$@"); COMP_CWORD=$(($# - 1)); _maint; printf "%s\\n" "${COMPREPLY[@]}"')
         for words, expected in ((["maint", ""], ["help", "list", "ai", "sys"]),
                 (["maint", "a"], ["ai"]), (["maint", "ai", "st"], ["start", "stop", "status"]),
@@ -485,17 +495,24 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
 
     def test_modules_are_discovered_and_broken_modules_are_skipped(self):
         self.add_probe_module()
-        (self.toolkit / "modules/broken.sh").write_text("MODULE_TITLE='Broken'\nMODULE_ACTIONS=('go|Go')\n")
+        (self.maint_root / "modules/broken.sh").write_text("MODULE_TITLE='Broken'\nMODULE_ACTIONS=('go|Go')\n")
+        (self.maint_root / "modules/empty.sh").write_text("MODULE_TITLE='Empty'\n")
+        (self.maint_root / "modules/noisy.sh").write_text(
+            "MODULE_TITLE='Noisy'\nMODULE_ACTIONS=('go|Go')\necho noise-at-load\naction_go() { :; }\n")
         help_text = self.maint("help")
         self.assertEqual(help_text.returncode, 0, help_text.stderr)
         self.assertIn("maint probe work", help_text.stdout)
         self.assertIn("maint ai start", help_text.stdout)
         self.assertNotIn("broken", help_text.stdout)
         self.assertIn("Skipping module broken.sh", help_text.stderr)
+        self.assertIn("Skipping module empty.sh", help_text.stderr)
+        self.assertNotIn("unbound", help_text.stderr)
         listing = self.maint("list")
         self.assertEqual(listing.returncode, 0, listing.stderr)
         self.assertIn("probe\twork\tProbe\tDo probe work\n", listing.stdout)
         self.assertIn("ai\tstart\tLocal AI\t", listing.stdout)
+        self.assertIn("noisy\tgo\tNoisy\tGo\n", listing.stdout)
+        self.assertNotIn("noise-at-load", listing.stdout)
         self.assertNotIn("broken", listing.stdout)
         result = self.maint("probe", input="1\n0\n")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -506,8 +523,8 @@ printf '%s\\n' "${CONTAINER_STATE:-running|healthy}"
         self.add_probe_module()
         for action, expected_tail in (("work", "probe-work"), ("early", "after-summary")):
             with self.subTest(action=action):
-                (self.toolkit / "logs/probe.log").unlink(missing_ok=True)
-                for path in (self.toolkit / "logs/probe").glob("*.log"):
+                (self.maint_root / "logs/probe.log").unlink(missing_ok=True)
+                for path in (self.maint_root / "logs/probe").glob("*.log"):
                     path.unlink()
                 result = self.maint("probe", action)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -630,7 +647,7 @@ exit 42
                     second_run.append(self.run_script(self.probe("info second-run")))
                     return "\n"
 
-                result, output = self.terminal_run(self.hub, "probe", replies=(
+                result, output = self.terminal_run(self.entry_point, "probe", replies=(
                     ("Choose [0-4]:", "1\n"),
                     ("Press Enter to return to the menu", check_released),
                     ("Choose [0-4]:", "0\n")))
@@ -644,7 +661,7 @@ exit 42
         for status in (0, 42):
             with self.subTest(status=status):
                 self.env["PROBE_EXIT"] = str(status)
-                result, output = self.terminal_run(self.hub, "probe", "work")
+                result, output = self.terminal_run(self.entry_point, "probe", "work")
                 self.assertEqual(result, status, output)
                 self.assertNotIn("Press Enter", output)
 
@@ -652,7 +669,7 @@ exit 42
         self.add_probe_module()
         for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             with self.subTest(signal_number=signal_number):
-                status, output = self.terminal_run(self.hub, "probe",
+                status, output = self.terminal_run(self.entry_point, "probe",
                     replies=(("Choose [0-4]:", "2\n"),), interrupt=signal_number)
                 self.assertEqual(status, 128 + signal_number, output)
                 self.assertNotIn("Press Enter", output)
@@ -732,11 +749,11 @@ if confirm_phrase 'Remove?' 'APPLY'; then info removal-approved; else info remov
                 env={**self.env, "LOG_TEST_DATE": "2026-10-09"})
             with self.assertRaises(subprocess.TimeoutExpired):
                 second.communicate(timeout=0.2)
-            self.assertEqual((self.toolkit / "logs/probe.log").resolve().name, "2026-10-08.log")
+            self.assertEqual((self.maint_root / "logs/probe.log").resolve().name, "2026-10-08.log")
             release.touch()
             self.assertEqual(first.wait(timeout=3), 0)
             self.assertEqual(second.wait(timeout=3), 0)
-            previous = (self.toolkit / "logs/probe/2026-10-08.log").read_text()
+            previous = (self.maint_root / "logs/probe/2026-10-08.log").read_text()
             self.assertIn("first-finished", previous)
             self.assertNotIn("second-run", previous)
             self.assertIn("second-run", self.log())
@@ -760,7 +777,7 @@ else
     exec /usr/bin/date "$@"
 fi
 ''')
-        logs = self.toolkit / "logs"
+        logs = self.maint_root / "logs"
         logs.mkdir()
         with (logs / ".probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)

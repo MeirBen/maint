@@ -57,7 +57,7 @@ action_trim() {
 
 Each `name|description` entry needs an `action_<name>` function. The menu, `maint help`, `maint list`, Tab completion, and `maint disk trim` pick it up automatically; a module that fails to load is skipped with a message.
 
-Each action runs in its own process, `lib/run.sh`, with only `lib/common.sh` and its own module loaded. Actions use these helpers and must not redefine them: `info`, `success`, `warn_condition`, `warn_note`, `error`, `run`, `run_root`, `as_root`, `require_sudo`, `require_commands`, `confirm`, `confirm_phrase`, `create_temp_dir`, and `show_completion_summary`. Any failing command stops the action and is logged with its call chain. After an action succeeds, its summary of warnings and duration is logged automatically; call `show_completion_summary` yourself only to log it earlier, as the `sys` example does before offering a reboot.
+Each action runs in its own process, `lib/run.sh`, with only `lib/common.sh` and its own module loaded. Actions use these helpers: `info`, `success`, `warn_condition`, `warn_note`, `error`, `print_and_log`, `run`, `run_root`, `as_root`, `require_sudo`, `require_commands`, `confirm`, `confirm_phrase`, `create_temp_dir`, and `show_completion_summary`. They may also read `LOG_FILE`, to append raw command output, and `TMP_DIR`, the folder `create_temp_dir` makes and the run removes. A module must not redefine anything `lib/common.sh` defines. Actions run under `set -Eeuo pipefail`, so a failing command, a failing pipeline stage, or an unset variable stops the action. A failing command is logged with its call chain; any other failure is logged with its exit code. After an action succeeds, its summary of warnings and duration is logged automatically; call `show_completion_summary` yourself only to log it earlier, as the `sys` example does before offering a reboot.
 
 ## Example modules
 
@@ -104,11 +104,11 @@ The terminal menu is one front end. Another, such as a desktop UI, can drive the
 - `modules/` — one file per module; `sys.sh` and `ai.sh` are the examples.
 - `completion.bash` — Tab completion, read from `maint list`.
 - `install.sh`, `uninstall.sh`, `icons/` — command, completion, and desktop launcher setup.
-- `tests/test_toolkit.py` — isolated regression tests.
+- `tests/test_maint.py` — isolated regression tests.
 
 ## Logs
 
-Each module writes to `logs/<module>/YYYY-MM-DD.log`, keeping `LOG_RETENTION_DAYS` days (90) including today; `logs/<module>.log` links to today's file. Every run starts with a `=====` header naming the action, user, and process ID, and failures or interruptions are logged with their cause. Only one run of each module proceeds at a time; another says it is waiting and waits up to `LOCK_WAIT_SECONDS` (180).
+Each module writes to `logs/<module>/YYYY-MM-DD.log`, keeping `LOG_RETENTION_DAYS` days (90) including today; `logs/<module>.log` links to today's file. Every run starts with a `=====` header naming the action, user, and process ID, and every failure or interruption is logged. Only one run of each module proceeds at a time; another says it is waiting and waits up to `LOCK_WAIT_SECONDS` (180).
 
 ## Checks
 
