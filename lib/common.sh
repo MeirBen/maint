@@ -7,12 +7,12 @@ MAINT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_RETENTION_DAYS=90    # Daily logs kept per module, today included.
 LOCK_WAIT_SECONDS=180    # How long a run waits for another run of the same module.
 
-# Starts an action run: takes the per-tool lock, opens today's log, installs traps.
+# Starts an action run: takes the per-module lock, opens today's log, installs traps.
 initialize_runtime() {
-    local tool="$1" run_day lock_file
+    local module="$1" run_day lock_file
     TASK_LABEL="$2"
     LOG_DIR="${MAINT_ROOT}/logs"
-    LOG_FILE="${LOG_DIR}/${tool}.log"
+    LOG_FILE="${LOG_DIR}/${module}.log"
     TMP_DIR=""
     WARNING_COUNT=0
     START_TIME=$SECONDS
@@ -29,7 +29,7 @@ initialize_runtime() {
 
     # Lock a stable file: the current-log link changes when the day changes.
     mkdir -p -- "$LOG_DIR"
-    lock_file="${LOG_DIR}/.${tool}.lock"
+    lock_file="${LOG_DIR}/.${module}.lock"
     exec {LOCK_FD}>>"$lock_file"
     if (( EUID == 0 )); then
         chown --reference="$MAINT_ROOT" -- "$LOG_DIR" "$lock_file"
@@ -50,13 +50,13 @@ initialize_runtime() {
     trap 'INTERRUPTED_BY=SIGINT; exit 130' INT
     trap 'INTERRUPTED_BY=SIGTERM; exit 143' TERM
 
-    prepare_daily_log "$tool" "$run_day"
+    prepare_daily_log "$module" "$run_day"
     info "===== ${TASK_LABEL} | user $(id -un) | pid $$ ====="
     info "Log file: ${LOG_FILE}"
 }
 
 prepare_daily_log() {
-    local tool="$1" day="$2" history_dir="${LOG_DIR}/$1" cutoff daily_log path name
+    local module="$1" day="$2" history_dir="${LOG_DIR}/$1" cutoff daily_log path name
     # Calendar days counted from noon, independent of DST changes.
     cutoff="$(date --date="${day} 12:00:00 $((LOG_RETENTION_DAYS - 1)) days ago" +%F)"
     daily_log="${history_dir}/${day}.log"
@@ -65,9 +65,9 @@ prepare_daily_log() {
     if (( EUID == 0 )); then
         chown --reference="$MAINT_ROOT" -- "$history_dir" "$daily_log"
     fi
-    ln -sfnT -- "${tool}/${day}.log" "$LOG_FILE"
+    ln -sfnT -- "${module}/${day}.log" "$LOG_FILE"
 
-    # Only this tool's regular dated logs are eligible for retention cleanup.
+    # Only this module's regular dated logs are eligible for retention cleanup.
     for path in "$history_dir"/*.log; do
         [[ -f "$path" && ! -L "$path" ]] || continue
         name="${path##*/}"
@@ -171,7 +171,8 @@ create_temp_dir() {
     TMP_DIR="$(mktemp -d "${LOG_DIR}/maint.XXXXXX")"
 }
 
-# Logs the failing call chain, e.g. "action_update (system.sh:33) > run (common.sh:113)".
+# Logs the failing call chain, for example
+# "action_trim (disk.sh:11) > run_root (common.sh:131) > run (common.sh:116)".
 on_error() {
     local status="$1" line="$2" frame last=$(( ${#FUNCNAME[@]} - 1 )) trace=""
     trap - ERR

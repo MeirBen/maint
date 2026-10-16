@@ -24,12 +24,12 @@ cat > "$LAUNCHER" <<EOF
 Version=1.0
 Type=Application
 Name=Maintenance
-Comment=Ubuntu updates, drivers, firmware, and Local AI controls
+Comment=Run maintenance modules from one menu
 Exec=${COMMAND}
 Icon=${ROOT}/icons/maint.png
 Terminal=true
 Categories=System;
-Keywords=maint;update;upgrade;maintenance;drivers;firmware;cleanup;ai;
+Keywords=maint;maintenance;update;upgrade;cleanup;
 StartupNotify=true
 EOF
 chmod 755 "$LAUNCHER"

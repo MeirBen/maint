@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# maint: the Maintenance command. One entry point for every module in modules/; see `maint help`.
+# maint: entry point of the modular maintenance framework. Discovers the modules in modules/,
+# then opens the menu or runs one action; see `maint help`.
 
 MAINT_ROOT="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 # Actions run in this separate process; the menu and command line never load lib/common.sh.

@@ -1,30 +1,20 @@
-# Maintenance
+# maint
 
-`maint` is one command and one desktop launcher for Ubuntu maintenance and the local AI stack.
+`maint` is a modular maintenance framework: one command, one terminal menu, and one desktop launcher for whatever modules sit in `modules/`. The framework provides discovery, the menu and command line, Tab completion, per-module logs, locking, administrator access, prompts, and cleanup; a module only declares its actions. Two example modules ship with it, `sys` and `ai`; see [Example modules](#example-modules).
 
 ## Usage
 
 ```bash
 maint                 # Menu of every action; returns to the menu after each one
-maint ai              # Menu of one module's actions
-maint ai start        # Run one action and exit
+maint MODULE          # Menu of one module's actions
+maint MODULE ACTION   # Run one action and exit
 maint help            # Show every command
 maint list            # Every action as tab-separated MODULE, ACTION, TITLE, DESCRIPTION
 ```
 
-Press Tab to complete module and action names, for example `maint ai st<Tab>`.
+Press Tab to complete module and action names.
 
-| Command | Action |
-| --- | --- |
-| `maint sys update` | Update and clean up Ubuntu: APT, drivers, firmware, Flatpak, Snap |
-| `maint ai start` | Start Open WebUI + Ollama and open the chat |
-| `maint ai stop` | Stop Open WebUI + Ollama |
-| `maint ai update` | Update Ollama, the Phi model, and Open WebUI |
-| `maint ai status` | Show Ollama, Docker, and Open WebUI status |
-
-- Actions ask for your password when needed. Running with `sudo` also works; `sudo maint ai start` prints the chat URL instead of opening the browser.
-- `maint sys update` installs normal APT, Flatpak, and Snap updates automatically and respects APT phased updates. Phasing overrides, full upgrades, package removals, driver and firmware installs, and rebooting ask first; full upgrades that remove packages require typing `APPLY`.
-- `maint ai status` only reads service state and never starts services. It reports `UNKNOWN` when Docker is stopped or a query fails, and shows container health only while Open WebUI is running.
+- Actions ask for your password when they need administrator access. Running with `sudo` also works.
 - Ctrl+C, closing the terminal, or `SIGTERM` stops the running action, cleans up, and exits the menu.
 - A mistyped module or action lists the valid choices.
 
@@ -37,18 +27,16 @@ Press Tab to complete module and action names, for example `maint ai st<Tab>`.
 
 Run them as your own user; they ask for sudo only to change `/usr/local/bin`. Open a new terminal after installing for Tab completion. Re-run `install.sh` after moving this folder. Uninstalling keeps `logs/`; delete this folder to remove everything.
 
-Local AI actions call `/usr/local/sbin/local-ai-service-control` and `/usr/local/libexec/local-ai-update.py`, which are installed separately from this repository.
-
 ## Configure
 
-- **Disable a module:** rename it so it no longer ends in `.sh`, for example `mv modules/ai.sh modules/ai.sh.off`. It disappears from the menu, `maint help`, `maint list`, and Tab completion at once; rename it back to enable it. To remove it for good, delete the file.
-- **Module settings** sit in a `# Settings.` block at the top of each module: `MIN_ROOT_FREE_GIB` in `modules/sys.sh`; `SERVICE_CONTROL`, `DOCKER`, `CONTAINER`, and `CHAT_URL` in `modules/ai.sh`.
+- **Disable a module:** rename it so it no longer ends in `.sh`, for example `mv modules/MODULE.sh modules/MODULE.sh.off`. It disappears from the menu, `maint help`, `maint list`, and Tab completion at once; rename it back to enable it. To remove it for good, delete the file.
+- **Module settings** sit in a `# Settings.` block at the top of each module.
 - **Shared settings** sit at the top of `lib/common.sh`: `LOG_RETENTION_DAYS` and `LOCK_WAIT_SECONDS`.
 - **Menu text** is the `MODULE_TITLE` and the `MODULE_ACTIONS` descriptions of each module.
 
 Changes apply on the next run; nothing needs reinstalling.
 
-## Adding a module
+## Writing a module
 
 Drop a file such as `modules/disk.sh` into `modules/`. Its name is the module name, and it only defines variables and functions:
 
@@ -69,7 +57,35 @@ action_trim() {
 
 Each `name|description` entry needs an `action_<name>` function. The menu, `maint help`, `maint list`, Tab completion, and `maint disk trim` pick it up automatically; a module that fails to load is skipped with a message.
 
-Each action runs in its own process, `lib/run.sh`, with only `lib/common.sh` and its own module loaded. Actions use these helpers and must not redefine them: `info`, `success`, `warn_condition`, `warn_note`, `error`, `run`, `run_root`, `as_root`, `require_sudo`, `require_commands`, `confirm`, `confirm_phrase`, `create_temp_dir`, and `show_completion_summary`. Any failing command stops the action and is logged with its call chain. After an action succeeds, its summary of warnings and duration is logged automatically; call `show_completion_summary` yourself only to log it earlier, as `modules/sys.sh` does before offering a reboot.
+Each action runs in its own process, `lib/run.sh`, with only `lib/common.sh` and its own module loaded. Actions use these helpers and must not redefine them: `info`, `success`, `warn_condition`, `warn_note`, `error`, `run`, `run_root`, `as_root`, `require_sudo`, `require_commands`, `confirm`, `confirm_phrase`, `create_temp_dir`, and `show_completion_summary`. Any failing command stops the action and is logged with its call chain. After an action succeeds, its summary of warnings and duration is logged automatically; call `show_completion_summary` yourself only to log it earlier, as the `sys` example does before offering a reboot.
+
+## Example modules
+
+`sys` and `ai` are ordinary modules, written the same way as `disk.sh` above. Use them as templates for your own, or disable either one; the framework does not depend on them, but the regression tests exercise both.
+
+### `sys`: one long, guarded action
+
+| Command | Action |
+| --- | --- |
+| `maint sys update` | Update and clean up Ubuntu: APT, drivers, firmware, Flatpak, Snap |
+
+- **Shows** a multi-step action split into small functions, a temporary folder from `create_temp_dir`, confirmations graded by risk (`confirm`, and `confirm_phrase` for the riskiest step), and an early `show_completion_summary` before a final reboot prompt.
+- **Behavior:** installs normal APT, Flatpak, and Snap updates automatically and respects APT phased updates. Phasing overrides, full upgrades, package removals, driver and firmware installs, and rebooting ask first; full upgrades that remove packages require typing `APPLY`.
+- **Settings:** `MIN_ROOT_FREE_GIB`.
+
+### `ai`: several short actions around a service
+
+| Command | Action |
+| --- | --- |
+| `maint ai start` | Start Open WebUI + Ollama and open the chat |
+| `maint ai stop` | Stop Open WebUI + Ollama |
+| `maint ai update` | Update Ollama, the Phi model, and Open WebUI |
+| `maint ai status` | Show Ollama, Docker, and Open WebUI status |
+
+- **Shows** actions sharing one helper, an external root helper checked with `require_commands` and run with `run_root`, a read-only status action, and a step whose failure is only a warning (`warn_condition` when the browser cannot open).
+- **Behavior:** `sudo maint ai start` prints the chat URL instead of opening the browser. `maint ai status` only reads service state and never starts services; it reports `UNKNOWN` when Docker is stopped or a query fails, and shows container health only while Open WebUI is running.
+- **Settings:** `SERVICE_CONTROL`, `DOCKER`, `CONTAINER`, and `CHAT_URL`.
+- **Requires** `/usr/local/sbin/local-ai-service-control` and `/usr/local/libexec/local-ai-update.py`, which are installed separately from this repository.
 
 ## Front ends
 
@@ -77,7 +93,7 @@ The terminal menu is one front end. Another, such as a desktop UI, can drive the
 
 - Discover actions with `maint list`, run one with `maint MODULE ACTION`, and read its exit code: `0` success, `129`/`130`/`143` interrupted, anything else a failure (a command that is not in the list exits with `2`).
 - Output lines read `[YYYY-MM-DD HH:MM:SS] [LEVEL] message` (`INFO`, `OK`, `WARN`, `NOTE`, `SUMMARY`, `ERROR`), uncolored when output is not a terminal, interleaved with the output of commands the action runs.
-- Without a terminal, every confirmation answers No, so a full upgrade, driver or firmware install, or reboot is skipped. A front end that approves them must provide its own prompt through `confirm` and `confirm_phrase` in `lib/common.sh`.
+- Without a terminal, every confirmation answers No; each module decides whether a declined step is skipped or stops the action. A front end that approves them must provide its own prompt through `confirm` and `confirm_phrase` in `lib/common.sh`.
 - Administrator access goes only through `require_sudo`, `as_root`, and `run_root` in `lib/common.sh`; a front end without a terminal needs a graphical sudo helper there, such as `SUDO_ASKPASS` or pkexec.
 
 ## Files
@@ -85,7 +101,7 @@ The terminal menu is one front end. Another, such as a desktop UI, can drive the
 - `maint` — command line, menu, and module registry.
 - `lib/run.sh` — runs one action in its own process.
 - `lib/common.sh` — settings, logging, locking, privileges, prompts, and cleanup for each action run.
-- `modules/` — one file per module: `sys.sh` (System) and `ai.sh` (Local AI).
+- `modules/` — one file per module; `sys.sh` and `ai.sh` are the examples.
 - `completion.bash` — Tab completion, read from `maint list`.
 - `install.sh`, `uninstall.sh`, `icons/` — command, completion, and desktop launcher setup.
 - `tests/test_toolkit.py` — isolated regression tests.
