@@ -1,6 +1,6 @@
 # maint
 
-`maint` is a modular maintenance framework: one command, one terminal menu, and one desktop launcher for whatever modules sit in `modules/`. The framework provides discovery, the menu and command line, Tab completion, per-module logs, locking, administrator access, prompts, and cleanup; a module only declares its actions. Two example modules ship with it, `sys` and `ai`; see [Example modules](#example-modules).
+`maint` is a modular maintenance framework: one command, one terminal menu, and one desktop launcher for whatever modules sit in `modules/`. The framework provides discovery, the menu and command line, Tab completion, per-module logs, locking, administrator access, prompts, and cleanup; a module only declares its actions. The `sys` example module ships with it; see [Example modules](#example-modules).
 
 ## Usage
 
@@ -61,7 +61,7 @@ Each action runs in its own process, `lib/run.sh`, with only `lib/common.sh` and
 
 ## Example modules
 
-`sys` and `ai` are ordinary modules, written the same way as `disk.sh` above. Use them as templates for your own, or disable either one; the framework does not depend on them, but the regression tests exercise both.
+`sys` is an ordinary module, written the same way as `disk.sh` above. Use it as a template for your own, or disable it; the framework does not depend on it.
 
 ### `sys`: one long, guarded action
 
@@ -72,20 +72,6 @@ Each action runs in its own process, `lib/run.sh`, with only `lib/common.sh` and
 - **Shows** a multi-step action split into small functions, a temporary folder from `create_temp_dir`, confirmations graded by risk (`confirm`, and `confirm_phrase` for the riskiest step), and an early `show_completion_summary` before a final reboot prompt.
 - **Behavior:** installs normal APT, Flatpak, and Snap updates automatically and respects APT phased updates. Phasing overrides, full upgrades, package removals, driver and firmware installs, and rebooting ask first; full upgrades that remove packages require typing `APPLY`.
 - **Settings:** `MIN_ROOT_FREE_GIB`.
-
-### `ai`: several short actions around a service
-
-| Command | Action |
-| --- | --- |
-| `maint ai start` | Start Open WebUI + Ollama and open the chat |
-| `maint ai stop` | Stop Open WebUI + Ollama |
-| `maint ai update` | Update Ollama, the Phi model, and Open WebUI |
-| `maint ai status` | Show Ollama, Docker, and Open WebUI status |
-
-- **Shows** actions sharing one helper, an external root helper checked with `require_commands` and run with `run_root`, a read-only status action, and a step whose failure is only a warning (`warn_condition` when the browser cannot open).
-- **Behavior:** `sudo maint ai start` prints the chat URL instead of opening the browser. `maint ai status` only reads service state and never starts services; it reports `UNKNOWN` when Docker is stopped or a query fails, and shows container health only while Open WebUI is running.
-- **Settings:** `SERVICE_CONTROL`, `DOCKER`, `CONTAINER`, and `CHAT_URL`.
-- **Requires** `/usr/local/sbin/local-ai-service-control` and `/usr/local/libexec/local-ai-update.py`, which are installed separately from this repository.
 
 ## Front ends
 
@@ -101,7 +87,7 @@ The terminal menu is one front end. Another, such as a desktop UI, can drive the
 - `maint` — command line, menu, and module registry.
 - `lib/run.sh` — runs one action in its own process.
 - `lib/common.sh` — settings, logging, locking, privileges, prompts, and cleanup for each action run.
-- `modules/` — one file per module; `sys.sh` and `ai.sh` are the examples.
+- `modules/` — one file per module; `sys.sh` is the example.
 - `completion.bash` — Tab completion, read from `maint list`.
 - `install.sh`, `uninstall.sh`, `icons/` — command, completion, and desktop launcher setup.
 - `tests/test_maint.py` — isolated regression tests.
