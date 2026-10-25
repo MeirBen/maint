@@ -14,6 +14,8 @@ maint list            # Every action as tab-separated MODULE, ACTION, TITLE, DES
 
 Press Tab to complete module and action names.
 
+Menus wrap to the terminal width. Docker inventory uses aligned columns when they fit and labeled entries in narrower windows; logs and redirected Docker output keep the full tab-separated values. Set `NO_COLOR=1` for plain text.
+
 - Actions ask for your password when they need administrator access. Running with `sudo` also works.
 - Ctrl+C, closing the terminal, or `SIGTERM` stops the running action, cleans up, and exits the menu.
 - A mistyped module or action lists the valid choices.

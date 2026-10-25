@@ -69,7 +69,7 @@ docker_refresh_inventory() {
 }
 
 docker_show_inventory() {
-    local rows
+    local rows header=$'NUMBER\tCONTAINER\tSTATE\tHEALTH\tIMAGE\tCOMPOSE PROJECT/SERVICE'
     if [[ "$(jq length "$DOCKER_INVENTORY")" == 0 ]]; then
         info 'No containers found.'
         return
@@ -80,8 +80,53 @@ docker_show_inventory() {
          (if .Config.Labels["com.docker.compose.project"] then
             .Config.Labels["com.docker.compose.project"] + "/" +
             (.Config.Labels["com.docker.compose.service"] // "?") else "unmanaged" end)] | @tsv' "$DOCKER_INVENTORY")"
-    print_and_log $'NUMBER\tCONTAINER\tSTATE\tHEALTH\tIMAGE\tCOMPOSE PROJECT/SERVICE'
-    print_and_log "$rows"
+    if [[ ! -t 1 ]]; then
+        print_and_log "$header"$'\n'"$rows"
+        return
+    fi
+    # Keep complete, unstyled TSV in the log, independent of terminal size.
+    printf '%s\n%s\n' "$header" "$rows" >> "$LOG_FILE"
+    docker_render_inventory "$rows"
+}
+
+docker_render_inventory() {
+    local rows=$'#\tCONTAINER\tSTATE\tHEALTH\tIMAGE\tCOMPOSE PROJECT/SERVICE\n'"$1"
+    local column total=0 prefix
+    local -a widths=(0 0 0 0 0 0) cells=()
+    terminal_setup
+    while IFS=$'\t' read -r -a cells; do
+        for column in "${!widths[@]}"; do
+            if (( ${#cells[column]} > widths[column] )); then
+                widths[column]="${#cells[column]}"
+            fi
+        done
+    done <<< "$rows"
+    # Each column has two spaces before it, including the left margin.
+    for column in "${widths[@]}"; do total=$((total + column + 2)); done
+
+    printf '\n  %sContainers%s\n\n' "$TERMINAL_BOLD" "$TERMINAL_RESET"
+    if (( total <= TERMINAL_WIDTH - 2 )); then
+        while IFS=$'\t' read -r -a cells; do
+            printf '  %*s' "${widths[0]}" "${cells[0]}"
+            for ((column = 1; column < 5; column++)); do
+                printf '  %-*s' "${widths[column]}" "${cells[column]}"
+            done
+            printf '  %s\n' "${cells[5]}"
+            if [[ "${cells[0]}" == '#' ]]; then
+                terminal_rule "$((total - 2))"
+            fi
+        done <<< "$rows"
+    else
+        while IFS=$'\t' read -r -a cells; do
+            printf -v prefix '  %*s) ' "${widths[0]}" "${cells[0]}"
+            terminal_wrap "$prefix" "${cells[1]}" "$((TERMINAL_WIDTH - 2))"
+            terminal_wrap '     State    ' "${cells[2]} (health: ${cells[3]})" "$((TERMINAL_WIDTH - 2))"
+            terminal_wrap '     Image    ' "${cells[4]}" "$((TERMINAL_WIDTH - 2))"
+            terminal_wrap '     Compose  ' "${cells[5]}" "$((TERMINAL_WIDTH - 2))"
+            printf '\n'
+        done <<< "$1"
+    fi
+    printf '\n'
 }
 
 docker_select() {

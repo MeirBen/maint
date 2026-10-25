@@ -7,6 +7,8 @@ set -Eeuo pipefail
 MAINT_ROOT="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 # Actions run in this separate process; the menu and command line never load lib/common.sh.
 RUNNER="${MAINT_ROOT}/lib/run.sh"
+# shellcheck source=lib/terminal.sh
+source "${MAINT_ROOT}/lib/terminal.sh"
 
 # Registry in menu order, filled by load_modules: one ENTRY_* row per action.
 MODULE_IDS=()
@@ -115,7 +117,7 @@ list_actions() {
 # Each choice runs in its own runner process, so its lock, traps, and temporary files
 # are released before the menu returns.
 run_menu() {
-    local module_filter="${1:-}" index position choice status module
+    local module_filter="${1:-}" index position choice status module width prefix number_width
     local -a choices=()
     # Bash defers these until a running action exits, so it always cleans up first.
     trap 'exit 129' HUP
@@ -125,41 +127,50 @@ run_menu() {
             choices+=("$index")
         fi
     done
+    number_width="${#choices[@]}"
+    number_width="${#number_width}"
 
     while true; do
-        echo
-        echo 'Maintenance'
+        terminal_setup
+        width="$TERMINAL_WIDTH"
+        (( width <= 88 )) || width=88
+        printf '\n  %sMaintenance%s\n' "$TERMINAL_BOLD" "$TERMINAL_RESET"
+        terminal_rule "$((width - 4))"
         module=""
         for position in "${!choices[@]}"; do
             index="${choices[position]}"
             if [[ "${ENTRY_MODULES[index]}" != "$module" ]]; then
                 module="${ENTRY_MODULES[index]}"
-                printf '\n%s\n' "${MODULE_TITLES[$module]}"
+                printf '\n  %s%s%s\n' "$TERMINAL_ACCENT" "${MODULE_TITLES[$module]}" "$TERMINAL_RESET"
             fi
-            printf '  %2d) %s\n' "$((position + 1))" "${ENTRY_DESCRIPTIONS[index]}"
+            printf -v prefix '    %*d) ' "$number_width" "$((position + 1))"
+            terminal_wrap "$prefix" "${ENTRY_DESCRIPTIONS[index]}" "$((width - 2))"
         done
-        printf '\n   0) Exit\n\n'
+        printf '\n'
+        terminal_rule "$((width - 4))"
+        printf '    %*d) Exit\n\n' "$number_width" 0
 
         while true; do
-            read -r -p "Choose [0-${#choices[@]}]: " choice || return 0
+            read -r -p "  Choose [0-${#choices[@]}]: " choice || return 0
             if [[ "$choice" == 0 ]]; then
                 return 0
             fi
             if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && (( choice <= ${#choices[@]} )); then
                 break
             fi
-            echo "Please choose a number from 0 to ${#choices[@]}."
+            printf '  Please choose a number from 0 to %s.\n' "${#choices[@]}"
         done
 
         index="${choices[choice - 1]}"
         status=0
+        printf '\n'
         "$BASH" "$RUNNER" "${ENTRY_MODULES[index]}" "${ENTRY_ACTIONS[index]}" || status=$?
         case "$status" in
             129|130|143) return "$status" ;;
         esac
         if [[ -t 0 ]]; then
             echo
-            read -r -p 'Press Enter to return to the menu...' || return 0
+            read -r -p '  Press Enter to return to the menu...' || return 0
         fi
     done
 }

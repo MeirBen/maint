@@ -2,6 +2,8 @@
 # Shared runtime for maint actions: daily logs, locking, privileges, prompts, cleanup.
 
 MAINT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=terminal.sh
+source "${MAINT_ROOT}/lib/terminal.sh"
 
 # Settings.
 LOG_RETENTION_DAYS=90    # Daily logs kept per module, today included.
