@@ -333,7 +333,7 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
         outputs = []
         for arguments in (("--version",), ("-V",), ("--no-color", "--version"),
                 ("--version", "--help"), ("-V", "-h"), ("--version", "probe", "work"),
-                ("sys", "update", "--version")):
+                ("sys", "update", "--version"), ("--version", "--unknown")):
             result = self.maint(*arguments)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertRegex(result.stdout, r"^maint \d+\.\d+\.\d+\n$")

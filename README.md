@@ -17,7 +17,7 @@ maint --no-color docker list  # Run without maint's terminal colors
 maint list                    # Tab-separated MODULE, ACTION, TITLE, DESCRIPTION
 ```
 
-Options can appear before or after the module and action. `--` ends option parsing; for example, `maint -- docker list`. Unknown options, extra arguments, and unknown commands report an error on stderr and exit with status `2`. As in GNU tools, the first of `--help` and `--version` wins, and `--version` ignores the module and action; it does not load modules or initialize the action runtime. Help never runs an action: general help lists every action, the exit statuses, and `NO_COLOR`, while module and action help show only their own scope.
+Options can appear before or after the module and action. `--` ends option parsing; for example, `maint -- docker list`. Unknown options, extra arguments, and unknown commands report an error on stderr and exit with status `2`. As in GNU tools, `--version` ignores every option and argument after it, and an earlier `--help` wins over it; it does not load modules or initialize the action runtime. Help never runs an action: general help lists every action, the exit statuses, and `NO_COLOR`, while module and action help show only their own scope.
 
 Press Tab to complete options, module names, action names, and `help` targets. Existing `maint help`, menu navigation, action commands, and the machine-readable `maint list` format remain supported.
 

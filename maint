@@ -259,13 +259,18 @@ run_menu() {
 }
 
 main() {
-    local show_help=0 show_version=0 argument
+    local show_help=0 argument
     local -a arguments=()
     while (( $# > 0 )); do
         case "$1" in
             -h|--help) show_help=1 ;;
-            # As in GNU tools, the first of --help and --version wins.
-            -V|--version) (( show_help )) || show_version=1 ;;
+            # As in GNU tools, --version ignores everything after it, so it never loads modules or
+            # runs an action; an earlier --help wins.
+            -V|--version)
+                if (( ! show_help )); then
+                    printf 'maint %s\n' "$MAINT_VERSION"
+                    return 0
+                fi ;;
             --no-color) export NO_COLOR=1 ;;
             --) shift; arguments+=("$@"); break ;;
             -*) usage_error "Unknown option '$1'." ;;
@@ -274,11 +279,6 @@ main() {
         shift
     done
     set -- "${arguments[@]}"
-    # --version ignores the module and action, so it never loads modules or runs an action.
-    if (( show_version )); then
-        printf 'maint %s\n' "$MAINT_VERSION"
-        return 0
-    fi
     if [[ "${1:-}" == help ]]; then
         show_help=1
         shift
