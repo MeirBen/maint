@@ -29,6 +29,10 @@ def tags(image_id):
     return sorted(ref for ref, tagged in data['images'].items() if tagged == image_id)
 def in_use(image_id):
     return any(container['Image'] == image_id for container in data['containers'])
+def oneoff(container):
+    return container['Config']['Labels'].get('com.docker.compose.oneoff') == 'True'
+def attached(network):
+    return any(network in container['NetworkSettings']['Networks'] for container in data['containers'])
 if args == ['context', 'show']:
     print('test-context')
 elif args[:2] == ['context', 'inspect']:
@@ -60,6 +64,19 @@ elif args[:2] == ['image', 'rm']:
             data['store'].remove(image_id)
     save()
     print('Deleted')
+elif args[0] == 'rm':
+    if any(c['Id'] in args[1:] and c['State']['Running'] for c in data['containers']):
+        fail('cannot remove a running container')
+    data['containers'] = [c for c in data['containers'] if c['Id'] not in args[1:]]
+    save()
+elif args[:2] == ['network', 'ls']:
+    project = args[args.index('--filter') + 1].split('=')[-1]
+    print('\n'.join(n['name'] for n in data['networks'] if n['project'] == project))
+elif args[:2] == ['network', 'rm']:
+    if any(attached(name) for name in args[2:]):
+        fail('network has active endpoints')
+    data['networks'] = [n for n in data['networks'] if n['name'] not in args[2:]]
+    save()
 elif args[:2] == ['compose', 'version']:
     print('Docker Compose version test')
 elif args[0] == 'compose':
@@ -73,8 +90,15 @@ elif args[0] == 'compose':
     project = context['--project-name'][0]
     services = data['projects'][project]
     command = args[0]
-    members = [c for c in data['containers'] if owner(c)[0] == project]
-    if command == 'config':
+    members = [c for c in data['containers'] if owner(c)[0] == project and not oneoff(c)]
+    if command == 'config' and '--hash' in args:
+        for service in services:
+            print(service, data['hashes'].get(project + '/' + service, 'same-hash'))
+    elif command == 'config' and '--format' in args:
+        print(json.dumps({'services': {service: {'image': ref} for service, ref in services.items()},
+            'networks': {'default': {'name': project + '_default'}} |
+                {n['name']: {'name': n['name']} for n in data['networks'] if n['project'] == project and n.get('defined')}}))
+    elif command == 'config':
         if data.get('config_error') == project:
             fail('services.api.image: invalid reference')
     elif command == 'pull':
@@ -91,9 +115,9 @@ elif args[0] == 'compose':
     elif command == 'up' and '--no-start' in args:
         if '--remove-orphans' in args:
             data['containers'] = [c for c in data['containers'] if c not in members or owner(c)[1] in services]
-        for container in data['containers']:
+        for container in members:
             name, service = owner(container)
-            if name == project and service in services:
+            if service in services:
                 ref = services[service]
                 if container['Image'] != data['images'][ref] or container['Config']['Image'] != ref:
                     container['Id'] += '-recreated'
@@ -131,7 +155,8 @@ class DockerTests(unittest.TestCase):
             self.env.pop(key, None)
         self.command('docker', FAKE_DOCKER)
         self.command('sudo', '#!/bin/bash\nif [[ "$1" == -v ]]; then exit 0; fi\nexport FAKE_ROOT=1\nexec "$@"\n')
-        self.data = {'containers': [], 'images': {}, 'store': [], 'registry': {}, 'projects': {}}
+        self.data = {'containers': [], 'images': {}, 'store': [], 'registry': {}, 'projects': {},
+            'hashes': {}, 'networks': []}
 
     def compose_file(self, project):
         directory = self.root / 'projects with spaces' / project
@@ -151,12 +176,14 @@ class DockerTests(unittest.TestCase):
                 'com.docker.compose.project.config_files': str(compose),
                 'com.docker.compose.project.working_dir': str(compose.parent),
                 'com.docker.compose.oneoff': 'False',
+                'com.docker.compose.config-hash': 'same-hash',
             }
             self.data['projects'].setdefault(project, {})[service] = image
         old, new = 'sha256:old-' + image, 'sha256:new-' + image
         container = {'Id': name + '-id', 'Name': '/' + name, 'Image': old,
             'Config': {'Image': image, 'Labels': labels},
-            'State': {'Status': 'running' if running else 'exited', 'Running': running}}
+            'State': {'Status': 'running' if running else 'exited', 'Running': running},
+            'NetworkSettings': {'Networks': {project + '_default' if managed else 'bridge': {}}}}
         self.data['containers'].append(container)
         self.data['images'][image] = old
         self.data['registry'][image] = new
@@ -298,6 +325,44 @@ class DockerTests(unittest.TestCase):
         self.assertEqual(status, 0, output)
         names = {c['Name'] for c in self.saved()['containers']}
         self.assertEqual(names, {'/api', '/neighbor', '/manual'})
+
+    def test_settings_changes_and_removals_are_named_before_confirmation(self):
+        self.setup_docker()
+        self.add_container('api')
+        self.add_container('worker', service='worker', image='example/worker:1')
+        self.add_container('retired', service='retired', image='example/retired:1')
+        del self.data['projects']['sample']['retired']
+        self.data['hashes']['sample/api'] = 'port-changed'
+        status, output = self.update(answer='n')
+        self.assertEqual(status, 0, output)
+        notes = output[:output.index('[y/N]')]
+        self.assertIn('differ from the current containers for: api.', notes)
+        self.assertIn('their containers will be removed: retired', notes)
+        self.assertNotIn('worker', notes.split('[NOTE]', 1)[1])
+        self.assertFalse(self.mutations())
+
+    def test_cleanup_removes_unused_project_leftovers_and_keeps_what_is_in_use(self):
+        self.setup_docker()
+        self.add_container('api', running=False)
+        for name, running in (('run-done', False), ('run-live', True)):
+            container = self.add_container(name, running=running)
+            container['Config']['Labels']['com.docker.compose.oneoff'] = 'True'
+        self.data['containers'][-1]['NetworkSettings']['Networks']['sample_attached'] = {}
+        self.data['networks'] = [{'name': name, 'project': project} for name, project in (
+            ('sample_default', 'sample'), ('sample_legacy', 'sample'), ('sample_attached', 'sample'),
+            ('neighbor_legacy', 'neighbor'))] + [{'name': 'sample_spare', 'project': 'sample', 'defined': True}]
+        status, output = self.update()
+        self.assertEqual(status, 0, output)
+        self.assertIn('no warning conditions', output)
+        saved = self.saved()
+        self.assertEqual({c['Name']: c['State']['Running'] for c in saved['containers']},
+            {'/api': False, '/run-live': True})
+        self.assertEqual({n['name'] for n in saved['networks']},
+            {'sample_default', 'sample_attached', 'sample_spare', 'neighbor_legacy'})
+        self.assertIn('sha256:old-example/app:latest', saved['store'])
+        removed = [call for call in self.operations('rm') if 'image' not in call and 'network' not in call]
+        self.assertEqual(len(removed), 1)
+        self.assertIn('--volumes', removed[0])
 
     def test_selection_limits_every_change_to_the_chosen_projects(self):
         self.setup_docker()

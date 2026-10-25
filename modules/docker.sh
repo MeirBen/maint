@@ -5,7 +5,7 @@
 MODULE_TITLE='Docker'
 MODULE_ACTIONS=(
     'list|List containers by Compose project; changes nothing'
-    'update|Pull newer images, apply the current Compose files, and remove the replaced images'
+    'update|Pull newer images, apply the current Compose files, and remove what they leave behind'
 )
 
 # Settings.
@@ -57,10 +57,11 @@ action_update() {
         info 'No selected project can be updated.'
         return 0
     fi
-    warn_note 'Each project is brought in line with its current Compose files: changed services are recreated; containers of services no longer defined are removed.'
+    warn_note 'Settings such as ports, users, and environment are applied exactly as written in the Compose and environment files; changes made to containers by hand are not kept.'
+    warn_note 'Services whose image or settings changed are recreated; containers of services no longer defined are removed.'
     warn_note "Services that were running are started again and must be running/healthy within ${DOCKER_WAIT_SECONDS} seconds; stopped services stay stopped unless a running service depends on them."
-    warn_note 'Named volumes and bind mounts are kept. Recreation loses in-memory data, tmpfs contents, and changes made inside the container filesystem.'
-    warn_note 'Images the project ran before are removed once no container uses them and no other tag refers to them.'
+    warn_note 'Named volumes and bind mounts are kept. Recreation loses in-memory data, tmpfs contents, and files changed inside the container.'
+    warn_note 'Afterwards the leftovers each project owns are removed: replaced images, stopped one-off containers with their anonymous volumes, and networks it no longer defines. Named volumes are never removed.'
     if ! confirm "Update ${#ready[@]} Compose project(s)?"; then
         info 'Update cancelled; nothing was changed.'
         return 0
@@ -298,9 +299,34 @@ docker_check_project() {
         warn_condition "${project}: Compose reported the warnings above; review them before confirming."
     fi
     info "Ready: ${project} ($(jq -r "$DOCKER_JQ"'.[0] | compose("project.config_files") | gsub(","; ", ")' "$DOCKER_PROJECT"))"
+    docker_show_changes "$project"
 }
 
-# Converges every service without starting anything new, then restarts what was running before.
+# Names services whose settings differ from their deployed containers, so an unintended change, such as
+# an unset variable, is visible before confirming. Compose recreates exactly these services.
+docker_show_changes() {
+    local project="$1" hashes notes note
+    local -a lines=()
+    hashes="$(docker_exec "${DOCKER_COMPOSE[@]}" config --hash '*' 2> /dev/null)"
+    notes="$(jq -nr --arg hashes "$hashes" --slurpfile project "$DOCKER_PROJECT" "$DOCKER_JQ"'
+        ($hashes | split("\n") | map(select(. != "") | split(" ") | {key: .[0], value: .[1]}) | from_entries) as $model |
+        [$project[0][] | select(service_container)] as $deployed |
+        ([$deployed[] | compose("service") as $service |
+            select($model[$service] != null and $model[$service] != compose("config-hash")) | $service] | unique) as $changed |
+        ([$deployed[] | compose("service") | select($model[.] == null)] | unique) as $removed |
+        (select($changed != []) | "settings in the Compose files differ from the current containers for: " +
+            ($changed | join(", ")) + ". Expected after editing those files or upgrading Compose; otherwise decline and check for unset variables."),
+        (select($removed != []) | "no longer defined in the Compose files; their containers will be removed: " +
+            ($removed | join(", ")))')"
+    [[ -n "$notes" ]] || return 0
+    mapfile -t lines <<< "$notes"
+    for note in "${lines[@]}"; do
+        warn_note "${project}: ${note}"
+    done
+}
+
+# Converges every service without starting anything new, restarts what was running before,
+# then removes what the update left unused.
 docker_update_project() {
     local project="$1" services
     local -a running=()
@@ -315,8 +341,50 @@ docker_update_project() {
         docker_run "${DOCKER_COMPOSE[@]}" up --detach --wait --wait-timeout "$DOCKER_WAIT_SECONDS" \
             --pull never "${running[@]}"
     fi
-    docker_remove_replaced_images
+    docker_remove_leftovers "$project"
     success "${project}: updated from its Compose files; ${#running[@]} service(s) running."
+}
+
+# Removes only unused things the project owns. Named volumes and bind mounts hold application data and are kept.
+docker_remove_leftovers() {
+    local project="$1"
+    docker_load_inventory
+    docker_remove_oneoff_containers "$project"
+    docker_load_inventory
+    docker_remove_unused_networks "$project"
+    docker_remove_replaced_images
+}
+
+# Removes stopped containers left by `docker compose run` with their anonymous volumes, as `run --rm` would.
+# Running ones are still in use.
+docker_remove_oneoff_containers() {
+    local project="$1" ids
+    local -a containers=()
+    ids="$(jq -r --arg project "$project" "$DOCKER_JQ"'.[] | select(compose("project") == $project and
+        (service_container | not) and (.State.Running | not)) | .Id' "$DOCKER_INVENTORY")"
+    [[ -n "$ids" ]] || return 0
+    mapfile -t containers <<< "$ids"
+    if ! docker_run rm --volumes "${containers[@]}"; then
+        warn_condition "${project}: could not remove its stopped one-off containers; they were kept."
+    fi
+}
+
+# Removes the project's networks that its Compose files no longer define and no container references.
+docker_remove_unused_networks() {
+    local project="$1" listed unused
+    local -a networks=()
+    listed="$(docker_exec network ls --filter "label=com.docker.compose.project=${project}" --format '{{.Name}}')"
+    [[ -n "$listed" ]] || return 0
+    unused="$(docker_exec "${DOCKER_COMPOSE[@]}" config --format json 2> /dev/null |
+        jq -r --arg listed "$listed" --slurpfile all "$DOCKER_INVENTORY" '
+            [.networks // {} | .[].name] as $defined |
+            $listed | split("\n")[] | select(IN($defined[]) | not) |
+            select(. as $network | all($all[0][]; .NetworkSettings.Networks // {} | has($network) | not))')"
+    [[ -n "$unused" ]] || return 0
+    mapfile -t networks <<< "$unused"
+    if ! docker_run network rm "${networks[@]}"; then
+        warn_condition "${project}: could not remove networks it no longer defines; they were kept."
+    fi
 }
 
 # Removes images that DOCKER_PROJECT's containers ran before the update once no container uses them,
@@ -324,7 +392,6 @@ docker_update_project() {
 docker_remove_replaced_images() {
     local replaced id record tags
     local -a ids=() targets=()
-    docker_load_inventory
     replaced="$(jq -r --slurpfile now "$DOCKER_INVENTORY" '[.[].Image] - [$now[0][].Image] | unique[]' "$DOCKER_PROJECT")"
     [[ -n "$replaced" ]] || return 0
     mapfile -t ids <<< "$replaced"
