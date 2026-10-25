@@ -5,19 +5,19 @@
 ## Usage
 
 ```bash
-maint                       # Menu of every action; returns after each one
-maint MODULE                # Menu of one module's actions
-maint MODULE ACTION         # Run one action and exit
-maint --help                 # General help (-h also works)
-maint docker --help          # Help for one module
-maint docker update --help   # Help for one action
-maint help docker update     # Equivalent command-specific help
-maint --version              # Program version (-V also works)
+maint                         # Menu of every action; returns after each one
+maint MODULE                  # Menu of one module's actions
+maint MODULE ACTION           # Run one action and exit
+maint --help                  # General help (-h also works)
+maint docker --help           # Help for one module
+maint docker update --help    # Help for one action
+maint help docker update      # Equivalent command-specific help
+maint --version               # Program version (-V also works)
 maint --no-color docker list  # Run without maint's terminal colors
-maint list                   # Tab-separated MODULE, ACTION, TITLE, DESCRIPTION
+maint list                    # Tab-separated MODULE, ACTION, TITLE, DESCRIPTION
 ```
 
-Options can appear before or after the module and action. `--` ends option parsing; for example, `maint -- docker list`. Unknown options, extra arguments, and unknown commands report an error on stderr and exit with status `2`. `--version` is used without a command or `--help`; it does not load modules or initialize the action runtime. Help never runs an action.
+Options can appear before or after the module and action. `--` ends option parsing; for example, `maint -- docker list`. Unknown options, extra arguments, and unknown commands report an error on stderr and exit with status `2`. As in GNU tools, the first of `--help` and `--version` wins, and `--version` ignores the module and action; it does not load modules or initialize the action runtime. Help never runs an action: general help lists every action, the exit statuses, and `NO_COLOR`, while module and action help show only their own scope.
 
 Press Tab to complete options, module names, action names, and `help` targets. Existing `maint help`, menu navigation, action commands, and the machine-readable `maint list` format remain supported.
 

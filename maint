@@ -91,11 +91,44 @@ usage_error() {
     exit 2
 }
 
+# Prints "name|description" rows as aligned columns, or each description under its name when
+# fewer than 20 columns would remain for descriptions. Names are never wrapped or truncated.
+print_rows() {
+    local row name width=0 aligned=0
+    for row in "$@"; do
+        name="${row%%|*}"
+        (( ${#name} <= width )) || width="${#name}"
+    done
+    # Two-space margin and gap around the name column.
+    (( width + 4 + 20 > TERMINAL_WIDTH )) || aligned=1
+    for row in "$@"; do
+        if (( aligned )); then
+            printf -v name '  %-*s  ' "$width" "${row%%|*}"
+            terminal_wrap "$name" "${row#*|}" "$TERMINAL_WIDTH"
+        else
+            # Drop the indent that aligns long-only options in the column layout.
+            name="${row%%|*}"
+            printf '  %s\n' "${name#"${name%%[! ]*}"}"
+            terminal_wrap '    ' "${row#*|}" "$TERMINAL_WIDTH"
+        fi
+    done
+}
+
+# General help lists every action and the global sections; MODULE or ACTION help shows only its scope.
 usage() {
     local module="${1:-}" action="${2:-}" index
+    local -a rows=()
     terminal_setup
-    printf 'maint %s - System and container maintenance\n\n' "$MAINT_VERSION"
+    for index in "${!ENTRY_MODULES[@]}"; do
+        if [[ -z "$module" ]]; then
+            rows+=("${ENTRY_MODULES[index]} ${ENTRY_ACTIONS[index]}|${ENTRY_DESCRIPTIONS[index]}")
+        elif [[ "${ENTRY_MODULES[index]}" == "$module" ]]; then
+            rows+=("${ENTRY_ACTIONS[index]}|${ENTRY_DESCRIPTIONS[index]}")
+        fi
+    done
+
     if [[ -z "$module" ]]; then
+        printf 'maint %s - System and container maintenance\n\n' "$MAINT_VERSION"
         cat <<'EOF'
 Usage: maint [OPTIONS] [MODULE [ACTION]]
        maint help [MODULE [ACTION]]
@@ -106,44 +139,45 @@ Provide MODULE ACTION to run one action and exit.
 
 Commands:
 EOF
-        printf '  %-22s %s\n' \
-            'help [MODULE [ACTION]]' 'Show general or command-specific help' \
-            'list' 'List actions as tab-separated values'
+        print_rows 'help [MODULE [ACTION]]|Show general or command-specific help' \
+            'list|List actions as tab-separated values'
+        printf '\nActions:\n'
+        print_rows "${rows[@]}"
     elif [[ "$module" == list ]]; then
         printf 'Usage: maint [OPTIONS] list\n\n'
         printf 'Print tab-separated MODULE, ACTION, TITLE, DESCRIPTION for each action.\n'
     elif [[ -z "$action" ]]; then
         printf 'Usage: maint [OPTIONS] %s [ACTION]\n\n' "$module"
         printf 'Open the %s menu, or run one of its actions directly.\n' "${MODULE_TITLES[$module]}"
-    else
-        printf 'Usage: maint [OPTIONS] %s %s\n' "$module" "$action"
-    fi
-
-    if [[ "$module" != list ]]; then
         printf '\nActions:\n'
+        print_rows "${rows[@]}"
+    else
+        printf 'Usage: maint [OPTIONS] %s %s\n\n' "$module" "$action"
         for index in "${!ENTRY_MODULES[@]}"; do
-            [[ -z "$module" || "${ENTRY_MODULES[index]}" == "$module" ]] || continue
-            [[ -z "$action" || "${ENTRY_ACTIONS[index]}" == "$action" ]] || continue
-            terminal_wrap '  ' "maint ${ENTRY_MODULES[index]} ${ENTRY_ACTIONS[index]}" "$TERMINAL_WIDTH"
-            terminal_wrap '    ' "${ENTRY_DESCRIPTIONS[index]}" "$TERMINAL_WIDTH"
+            if [[ "${ENTRY_MODULES[index]}" == "$module" && "${ENTRY_ACTIONS[index]}" == "$action" ]]; then
+                terminal_wrap '' "${ENTRY_DESCRIPTIONS[index]}" "$TERMINAL_WIDTH"
+            fi
         done
     fi
+
     printf '\nOptions:\n'
-    printf '  %-22s %s\n' \
-        '-h, --help' 'Show help for the selected command and exit' \
-        '-V, --version' 'Show the program version and exit (used alone)' \
-        '    --no-color' "Disable maint's terminal colors" \
-        '    --' 'Stop parsing options'
-    cat <<'EOF'
+    print_rows '-h, --help|Show help for the selected command and exit' \
+        '-V, --version|Show the program version and exit' \
+        "    --no-color|Disable maint's terminal colors" \
+        '    --|Stop parsing options'
+    if [[ -z "$module" ]]; then
+        cat <<'EOF'
 
 Options may appear before or after MODULE and ACTION, up to --.
 
-Exit status:
-  0  Success or cancellation
-  2  Invalid command or arguments
-  Other failures preserve the action's exit status; Ctrl+C returns 130.
+Environment:
 EOF
-    if [[ -z "$module" ]]; then
+        print_rows "NO_COLOR|Disable maint's terminal colors when set to a non-empty value"
+        printf '\nExit status:\n'
+        print_rows '0|Success or cancellation' \
+            '2|Invalid command or arguments' \
+            '129, 130, 143|Interrupted by SIGHUP, SIGINT (Ctrl+C), or SIGTERM' \
+            "other|The action failed; its exit status is preserved"
         cat <<'EOF'
 
 Examples:
@@ -230,7 +264,8 @@ main() {
     while (( $# > 0 )); do
         case "$1" in
             -h|--help) show_help=1 ;;
-            -V|--version) show_version=1 ;;
+            # As in GNU tools, the first of --help and --version wins.
+            -V|--version) (( show_help )) || show_version=1 ;;
             --no-color) export NO_COLOR=1 ;;
             --) shift; arguments+=("$@"); break ;;
             -*) usage_error "Unknown option '$1'." ;;
@@ -239,8 +274,8 @@ main() {
         shift
     done
     set -- "${arguments[@]}"
+    # --version ignores the module and action, so it never loads modules or runs an action.
     if (( show_version )); then
-        (( show_help == 0 && $# == 0 )) || usage_error '--version must be used without a command or --help.'
         printf 'maint %s\n' "$MAINT_VERSION"
         return 0
     fi

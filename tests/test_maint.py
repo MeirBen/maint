@@ -331,7 +331,9 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
     def test_version_does_not_load_modules_or_initialize_runtime(self):
         (self.maint_root / "modules/noisy.sh").write_text('echo loaded > "$TRACE"\nreturn 1\n')
         outputs = []
-        for arguments in (("--version",), ("-V",), ("--no-color", "--version")):
+        for arguments in (("--version",), ("-V",), ("--no-color", "--version"),
+                ("--version", "--help"), ("-V", "-h"), ("--version", "probe", "work"),
+                ("sys", "update", "--version")):
             result = self.maint(*arguments)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertRegex(result.stdout, r"^maint \d+\.\d+\.\d+\n$")
@@ -345,13 +347,14 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
         self.add_probe_module()
         for arguments in (("help", "probe"), ("probe", "--help"), ("probe", "-h"),
                 ("help", "probe", "work"), ("probe", "work", "--help"),
-                ("--help", "probe", "work"), ("probe", "--help", "work")):
+                ("--help", "probe", "work"), ("probe", "--help", "work"),
+                ("probe", "--help", "--version"), ("-h", "-V", "probe", "work")):
             with self.subTest(arguments=arguments):
                 result = self.maint(*arguments)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Usage:", result.stdout)
                 self.assertIn("Do probe work", result.stdout)
-                self.assertNotIn("maint sys update", result.stdout)
+                self.assertNotIn("sys update", result.stdout)
                 if "work" in arguments:
                     self.assertNotIn("Wait for a signal", result.stdout)
                 self.assertEqual(result.stderr, "")
@@ -366,8 +369,7 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
     def test_invalid_options_and_operands_fail_before_running_actions(self):
         self.add_probe_module()
         for arguments in (("--unknown",), ("probe", "work", "--unknown"),
-                ("probe", "work", "--help", "--unknown"), ("--version", "probe"),
-                ("--version", "--help"), ("probe", "work", "extra"),
+                ("probe", "work", "--help", "--unknown"), ("probe", "work", "extra"),
                 ("list", "extra"), ("",), ("probe", ""), ("help", "missing")):
             with self.subTest(arguments=arguments):
                 result = self.maint(*arguments)
@@ -382,11 +384,15 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
         for module, columns in (("probe", "20"), ("extended_" + "module_" * 9, "80")):
             with self.subTest(module=module, columns=columns):
                 (self.maint_root / "modules" / (module + ".sh")).write_text(PROBE_MODULE)
-                result = self.maint(module, "--help", COLUMNS=columns)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                text = " ".join(result.stdout.split())
-                self.assertIn("maint " + module + " work", text)
-                self.assertIn("maint " + module + " wait", text)
+                general = self.maint("--help", COLUMNS=columns)
+                scoped = self.maint(module, "--help", COLUMNS=columns)
+                for result in (general, scoped):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(module + " work", general.stdout)
+                self.assertIn(module + " wait", general.stdout)
+                self.assertIn(module + " [ACTION]", scoped.stdout)
+                self.assertRegex(scoped.stdout, r"(?m)^ +work\b")
+                self.assertRegex(scoped.stdout, r"(?m)^ +wait\b")
 
     def test_no_color_option_reaches_action_runtime_in_any_position(self):
         self.add_probe_module()
@@ -445,8 +451,8 @@ action_--help() { info literal-action; }
             "MODULE_TITLE='Noisy'\nMODULE_ACTIONS=('go|Go')\necho noise-at-load\naction_go() { :; }\n")
         help_text = self.maint("help")
         self.assertEqual(help_text.returncode, 0, help_text.stderr)
-        self.assertIn("maint probe work", help_text.stdout)
-        self.assertIn("maint sys update", help_text.stdout)
+        self.assertIn("probe work", help_text.stdout)
+        self.assertIn("sys update", help_text.stdout)
         self.assertNotIn("broken", help_text.stdout)
         self.assertIn("Skipping module broken.sh", help_text.stderr)
         self.assertIn("Skipping module empty.sh", help_text.stderr)
