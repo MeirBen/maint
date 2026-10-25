@@ -320,8 +320,8 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
 
     def test_unknown_names_list_the_valid_choices(self):
         for arguments, expected in (
-                (["nope"], "Unknown module 'nope'. Choose from: sys."),
-                (["nope", "start"], "Unknown module 'nope'. Choose from: sys."),
+                (["nope"], "Unknown module 'nope'. Choose from: docker, sys."),
+                (["nope", "start"], "Unknown module 'nope'. Choose from: docker, sys."),
                 (["sys", "nope"], "Unknown action 'nope' for sys. Choose from: update.")):
             with self.subTest(arguments=arguments):
                 result = self.maint(*arguments)
@@ -333,7 +333,7 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
         (self.bin / "maint").symlink_to(self.entry_point)
         script = ("source " + shlex.quote(str(self.maint_root / "completion.bash")) +
             '\nCOMP_WORDS=("$@"); COMP_CWORD=$(($# - 1)); _maint; printf "%s\\n" "${COMPREPLY[@]}"')
-        for words, expected in ((["maint", ""], ["help", "list", "sys"]),
+        for words, expected in ((["maint", ""], ["help", "list", "docker", "sys"]),
                 (["maint", "s"], ["sys"]), (["maint", "sys", "u"], ["update"]),
                 (["maint", "sys", "update", ""], [""])):
             with self.subTest(words=words):

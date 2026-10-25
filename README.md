@@ -1,6 +1,6 @@
 # maint
 
-`maint` is a modular maintenance framework: one command, one terminal menu, and one desktop launcher for whatever modules sit in `modules/`. The framework provides discovery, the menu and command line, Tab completion, per-module logs, locking, administrator access, prompts, and cleanup; a module only declares its actions. The `sys` example module ships with it; see [Example modules](#example-modules).
+`maint` is a modular maintenance framework: one command, one terminal menu, and one desktop launcher for whatever modules sit in `modules/`. The framework provides discovery, the menu and command line, Tab completion, per-module logs, locking, administrator access, prompts, and cleanup; a module only declares its actions. The `sys` and `docker` modules ship with it; see [Example modules](#example-modules).
 
 ## Usage
 
@@ -73,6 +73,25 @@ Each action runs in its own process, `lib/run.sh`, with only `lib/common.sh` and
 - **Behavior:** installs normal APT, Flatpak, and Snap updates automatically and respects APT phased updates. Phasing overrides, full upgrades, package removals, driver and firmware installs, and rebooting ask first; full upgrades that remove packages require typing `APPLY`.
 - **Settings:** `MIN_ROOT_FREE_GIB`.
 
+### `docker`: discovered container images
+
+| Command | Action |
+| --- | --- |
+| `maint docker` | Open the Docker menu |
+| `maint docker list` | List all containers, including stopped ones, with their images and Compose owners |
+| `maint docker pull` | Re-pull selected image references; do not restart containers |
+| `maint docker update` | Pull images and recreate only selected Compose services whose image changed |
+
+- **Discovery:** reads the selected local Docker engine each time. No container names, image names, or project paths are configured in the module. Requires Docker Engine/CLI 28+ (API 1.49+ for platform-specific image inspection), Compose with `--wait`, and `jq`. Remote endpoints are rejected rather than replaced with the local daemon.
+- **Selection:** in a terminal, select `all` or container numbers separated by spaces/commas; Enter or `0` cancels. Without a terminal, selection includes all containers, but updates cannot pass the confirmation prompt. Pulls are deduplicated by image reference and deployed platform.
+- **Updates:** require typing `UPDATE`. The module uses the original project name, Compose files (in their recorded order), working directory, and recorded environment files. It compares Compose configuration hashes before applying images; missing files, unresolved variables, configuration drift, locally built images, one-off containers, and Swarm services are reported and skipped. Containers without Compose metadata can still be listed and their images pulled.
+- **Source of truth:** updates apply Compose-defined settings. Manual `docker update` overrides must first be recorded in those definitions; they are not imported. Resolved bind/volume targets and network names are checked against the current containers separately from the service hash. Custom managed network/volume options, secrets, configs, inherited volumes, and shared namespaces need updates through their owning project and are skipped.
+- **Scope:** select every replica of a service to update it. Mixed running/stopped replicas are skipped. Membership and configuration are checked again after pulling. Running services wait for running/healthy status; stopped services are recreated without being started. All pulls finish before any recreation; failures stop the action. A later service failure does not roll back services already updated. Avoid simultaneous deployments from other tools: the module lock coordinates `maint`, not external Docker clients.
+- **Data:** persistent mounts are retained, but recreation loses in-memory data, tmpfs contents, and writable container-layer changes. Plan database/cache updates accordingly. The module does not edit image tags or source files, build images, update dependencies, delete volumes, prune images, or create backups. New images may still introduce application behavior changes.
+- **Settings and logs:** `DOCKER_WAIT_SECONDS` controls the health wait (120 seconds); the existing runtime supplies locking, sudo, temporary-file cleanup, and `logs/docker.log`. Rendered Compose configuration and container environment variables are not printed to logs.
+
+The three actions appear automatically in the main menu, help, and Tab completion; reinstalling is unnecessary. Docker Engine itself remains part of `maint sys update` through APT.
+
 ## Front ends
 
 The terminal menu is one front end. Another, such as a desktop UI, can drive the same command:
@@ -87,10 +106,10 @@ The terminal menu is one front end. Another, such as a desktop UI, can drive the
 - `maint` — command line, menu, and module registry.
 - `lib/run.sh` — runs one action in its own process.
 - `lib/common.sh` — settings, logging, locking, privileges, prompts, and cleanup for each action run.
-- `modules/` — one file per module; `sys.sh` is the example.
+- `modules/` — standalone modules, including `sys.sh` and `docker.sh`.
 - `completion.bash` — Tab completion, read from `maint list`.
 - `install.sh`, `uninstall.sh`, `icons/` — command, completion, and desktop launcher setup.
-- `tests/test_maint.py` — isolated regression tests.
+- `tests/` — isolated framework and module regression tests.
 
 ## Logs
 
