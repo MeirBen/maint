@@ -10,8 +10,8 @@ maint MODULE                # Menu of one module's actions
 maint MODULE ACTION         # Run one action and exit
 maint --help                 # General help (-h also works)
 maint docker --help          # Help for one module
-maint docker pull --help     # Help for one action
-maint help docker pull       # Equivalent command-specific help
+maint docker update --help   # Help for one action
+maint help docker update     # Equivalent command-specific help
 maint --version              # Program version (-V also works)
 maint --no-color docker list  # Run without maint's terminal colors
 maint list                   # Tab-separated MODULE, ACTION, TITLE, DESCRIPTION
@@ -83,24 +83,27 @@ Each action runs in its own process, `lib/run.sh`, with only `lib/common.sh` and
 - **Behavior:** installs normal APT, Flatpak, and Snap updates automatically and respects APT phased updates. Phasing overrides, full upgrades, package removals, driver and firmware installs, and rebooting ask first; full upgrades that remove packages require typing `APPLY`.
 - **Settings:** `MIN_ROOT_FREE_GIB`.
 
-### `docker`: discovered container images
+### `docker`: Compose projects
 
 | Command | Action |
 | --- | --- |
 | `maint docker` | Open the Docker menu |
-| `maint docker list` | List all containers, including stopped ones, with their images and Compose owners |
-| `maint docker pull` | Re-pull selected image references; do not restart containers |
-| `maint docker update` | Pull images and recreate only selected Compose services whose image changed |
+| `maint docker list` | List every container, running or stopped, by Compose project; changes nothing |
+| `maint docker update` | Pull newer images, apply the current Compose files, and remove the replaced images |
 
-- **Discovery:** reads the selected local Docker engine each time. No container names, image names, or project paths are configured in the module. Requires Docker Engine/CLI 28+ (API 1.49+ for platform-specific image inspection), Compose with `--wait`, and `jq`. Remote endpoints are rejected rather than replaced with the local daemon.
-- **Selection:** in a terminal, select `all` or container numbers separated by spaces/commas; Enter or `0` cancels. Without a terminal, selection includes all containers, but updates cannot pass the confirmation prompt. Pulls are deduplicated by image reference and deployed platform.
-- **Updates:** require typing `UPDATE`. The module uses the original project name, Compose files (in their recorded order), working directory, and recorded environment files. It compares Compose configuration hashes before applying images; missing files, unresolved variables, configuration drift, locally built images, one-off containers, and Swarm services are reported and skipped. Containers without Compose metadata can still be listed and their images pulled.
-- **Source of truth:** updates apply Compose-defined settings. Manual `docker update` overrides must first be recorded in those definitions; they are not imported. Resolved bind/volume targets and network names are checked against the current containers separately from the service hash. Custom managed network/volume options, secrets, configs, inherited volumes, and shared namespaces need updates through their owning project and are skipped.
-- **Scope:** select every replica of a service to update it. Mixed running/stopped replicas are skipped. Membership and configuration are checked again after pulling. Running services wait for running/healthy status; stopped services are recreated without being started. All pulls finish before any recreation; failures stop the action. A later service failure does not roll back services already updated. Avoid simultaneous deployments from other tools: the module lock coordinates `maint`, not external Docker clients.
-- **Data:** persistent mounts are retained, but recreation loses in-memory data, tmpfs contents, and writable container-layer changes. Plan database/cache updates accordingly. The module does not edit image tags or source files, build images, update dependencies, delete volumes, prune images, or create backups. New images may still introduce application behavior changes.
-- **Settings and logs:** `DOCKER_WAIT_SECONDS` controls the health wait (120 seconds); the existing runtime supplies locking, sudo, temporary-file cleanup, and `logs/docker.log`. Rendered Compose configuration and container environment variables are not printed to logs.
+- **Unit of work:** a Compose project. `update` changes or removes only what the selected projects own: their containers and the images those containers ran. Containers created outside Compose are listed but never updated.
+- **Discovery:** reads the local Docker engine on each run; nothing about your containers is configured in the module. Each project is updated with the Compose files, working directory, and environment files recorded on its containers. A project whose files are missing or no longer resolve is reported and skipped. Requires the Docker CLI with Compose v2 and `jq`. Remote endpoints are rejected rather than replaced with the local daemon.
+- **Selection:** in a terminal, choose `all` or project numbers separated by spaces/commas; Enter or `0` cancels. Without a terminal, every project is checked, but the confirmation answers No and nothing changes.
+- **Update, in order:** check every selected project, show what will happen, and ask once. Then pull every project's images, all before the first change, so a registry failure leaves every project untouched. Then, one project at a time:
+  1. Re-read the project's containers.
+  2. Bring every service in line with the current Compose files without starting anything: Compose recreates containers whose image or settings changed and removes containers of services no longer defined.
+  3. Start the services that were running before and wait until they are running/healthy. Stopped services stay stopped unless a running service depends on them.
+  4. Remove the images the project ran before once no container uses them and every remaining tag on them is one the project used. An image another tag still refers to is kept and named in a note.
+- **Upgrades:** edit the image tag or settings in the Compose file, then run `update`; the edited definition is what gets applied. Images Compose builds locally are not pulled or rebuilt.
+- **Data:** named volumes and bind mounts are kept; the module runs no volume command. Recreation loses in-memory data, tmpfs contents, and changes made inside the container filesystem. A failure stops the action; projects already updated stay updated.
+- **Settings and logs:** `DOCKER_WAIT_SECONDS` sets the health wait (120 seconds). The runtime supplies locking, sudo, temporary-file cleanup, and `logs/docker.log`. The module lock coordinates `maint` runs only, not other Docker clients.
 
-The three actions appear automatically in the main menu, help, and Tab completion; reinstalling is unnecessary. Docker Engine itself remains part of `maint sys update` through APT.
+Both actions appear automatically in the main menu, help, and Tab completion; reinstalling is unnecessary. Docker Engine itself remains part of `maint sys update` through APT.
 
 ## Front ends
 

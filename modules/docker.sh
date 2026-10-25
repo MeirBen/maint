@@ -1,15 +1,82 @@
-# shellcheck shell=bash disable=SC2034 # Metadata is read by maint.
-# Docker: discover local containers; retain their owning Compose definitions.
+# shellcheck shell=bash disable=SC2034 # MODULE_TITLE and MODULE_ACTIONS are read by maint.
+# Docker: list local containers; update Compose projects from their current Compose files.
+# The unit of update is a Compose project: everything an update recreates or removes belongs to it.
 
 MODULE_TITLE='Docker'
 MODULE_ACTIONS=(
-    'list|List Docker containers, images, state, and Compose ownership'
-    'pull|Pull current container images again without restarting containers'
-    'update|Pull and apply changed images using the original Compose settings'
+    'list|List containers by Compose project; changes nothing'
+    'update|Pull newer images, apply the current Compose files, and remove the replaced images'
 )
 
 # Settings.
-DOCKER_WAIT_SECONDS=120    # Maximum wait for a recreated service to become healthy.
+DOCKER_WAIT_SECONDS=120    # Maximum wait for restarted services to become running/healthy.
+
+# jq definitions shared by every query over `docker inspect` records.
+DOCKER_JQ='
+def compose($name): .Config.Labels["com.docker.compose." + $name] // "";
+def name: .Name | ltrimstr("/");
+def state: .State.Status + (if .State.Health then " (" + .State.Health.Status + ")" else "" end);
+def service_container: (compose("oneoff") | ascii_downcase) != "true";
+def projects: [.[] | compose("project") | select(. != "")] | unique;
+def familiar: sub("^(index\\.)?docker\\.io/"; "") | sub("^library/"; "") |
+    if split("/")[-1] | test("[:@]") then . else . + ":latest" end;
+'
+
+action_list() {
+    docker_connect
+    docker_load_inventory
+    docker_show_inventory
+}
+
+action_update() {
+    local project
+    local -a ready=()
+    docker_connect
+    docker_load_inventory
+    docker_show_inventory
+    docker_load_projects
+    if (( ${#DOCKER_PROJECTS[@]} == 0 )); then
+        info 'No Compose projects to update.'
+        return 0
+    fi
+    if ! docker_exec compose version > /dev/null 2>&1; then
+        error 'Docker Compose v2 is required: the docker compose command is unavailable.'
+        return 1
+    fi
+    docker_select_projects
+    if (( ${#DOCKER_SELECTED[@]} == 0 )); then
+        info 'No project selected; nothing was changed.'
+        return 0
+    fi
+    for project in "${DOCKER_SELECTED[@]}"; do
+        if docker_check_project "$project"; then
+            ready+=("$project")
+        fi
+    done
+    if (( ${#ready[@]} == 0 )); then
+        info 'No selected project can be updated.'
+        return 0
+    fi
+    warn_note 'Each project is brought in line with its current Compose files: changed services are recreated; containers of services no longer defined are removed.'
+    warn_note "Services that were running are started again and must be running/healthy within ${DOCKER_WAIT_SECONDS} seconds; stopped services stay stopped unless a running service depends on them."
+    warn_note 'Named volumes and bind mounts are kept. Recreation loses in-memory data, tmpfs contents, and changes made inside the container filesystem.'
+    warn_note 'Images the project ran before are removed once no container uses them and no other tag refers to them.'
+    if ! confirm "Update ${#ready[@]} Compose project(s)?"; then
+        info 'Update cancelled; nothing was changed.'
+        return 0
+    fi
+    # Download everything first: a registry failure must leave every project untouched.
+    for project in "${ready[@]}"; do
+        if ! docker_compose_context "$project"; then
+            error "Stopping before any change: ${project} can no longer be reproduced."
+            return 1
+        fi
+        docker_run "${DOCKER_COMPOSE[@]}" pull --ignore-buildable
+    done
+    for project in "${ready[@]}"; do
+        docker_update_project "$project"
+    done
+}
 
 docker_exec() {
     if (( DOCKER_USE_SUDO )); then
@@ -27,12 +94,15 @@ docker_run() {
     fi
 }
 
-docker_discover() {
+# Pins the user's local Docker endpoint, then falls back to sudo only if that socket denies access.
+docker_connect() {
     local context endpoint
     require_commands docker jq
     create_temp_dir
+    DOCKER_INVENTORY="$TMP_DIR/containers.json"
+    DOCKER_PROJECT="$TMP_DIR/project.json"
     DOCKER_USE_SUDO=0
-    # Resolve the user's endpoint before sudo, which has its own Docker context.
+    # Resolve the endpoint before sudo, which has its own Docker context.
     if [[ -z "${DOCKER_CONTEXT:-}" && -n "${DOCKER_HOST:-}" ]]; then
         endpoint="$DOCKER_HOST"
     else
@@ -44,55 +114,60 @@ docker_discover() {
         return 1
     fi
     DOCKER_COMMAND=(docker --config "${DOCKER_CONFIG:-$HOME/.docker}" --host "$endpoint")
-    if ! docker_exec info > /dev/null 2> "$TMP_DIR/access-error"; then
+    if ! docker_exec info > /dev/null 2>&1; then
         require_sudo
         DOCKER_USE_SUDO=1
         docker_exec info > /dev/null
     fi
     info "Docker endpoint: ${endpoint}"
-    DOCKER_INVENTORY="$TMP_DIR/containers.json"
-    DOCKER_SELECTED="$TMP_DIR/selected.json"
-    docker_refresh_inventory
-    docker_show_inventory
 }
 
-docker_refresh_inventory() {
+docker_load_inventory() {
     local ids
     local -a container_ids=()
-    ids="$(docker_exec ps -aq --no-trunc)"
-    if [[ -n "$ids" ]]; then
-        mapfile -t container_ids <<< "$ids"
-        docker_exec inspect "${container_ids[@]}" | jq 'sort_by(.Name)' > "$DOCKER_INVENTORY"
-    else
+    ids="$(docker_exec ps --all --quiet --no-trunc)"
+    if [[ -z "$ids" ]]; then
         printf '[]\n' > "$DOCKER_INVENTORY"
+        return
+    fi
+    mapfile -t container_ids <<< "$ids"
+    docker_exec inspect "${container_ids[@]}" | jq 'sort_by(.Name)' > "$DOCKER_INVENTORY"
+}
+
+# Project numbers follow this sorted order in the inventory and in the selection prompt.
+docker_load_projects() {
+    local names
+    DOCKER_PROJECTS=()
+    names="$(jq -r "$DOCKER_JQ"'projects[]' "$DOCKER_INVENTORY")"
+    if [[ -n "$names" ]]; then
+        mapfile -t DOCKER_PROJECTS <<< "$names"
     fi
 }
 
 docker_show_inventory() {
-    local rows header=$'NUMBER\tCONTAINER\tSTATE\tHEALTH\tIMAGE\tCOMPOSE PROJECT/SERVICE'
+    local rows header=$'#\tPROJECT\tCONTAINER\tSTATE\tIMAGE'
     if [[ "$(jq length "$DOCKER_INVENTORY")" == 0 ]]; then
         info 'No containers found.'
         return
     fi
-    rows="$(jq -r 'to_entries[] | .key as $i | .value |
-        [($i + 1), (.Name | ltrimstr("/")), .State.Status,
-         (.State.Health.Status // "-"), .Config.Image,
-         (if .Config.Labels["com.docker.compose.project"] then
-            .Config.Labels["com.docker.compose.project"] + "/" +
-            (.Config.Labels["com.docker.compose.service"] // "?") else "unmanaged" end)] | @tsv' "$DOCKER_INVENTORY")"
+    rows="$(jq -r "$DOCKER_JQ"'projects as $projects |
+        (. as $all | $projects | to_entries[] | .key as $index | .value as $project |
+            $all[] | select(compose("project") == $project) | [$index + 1, $project, name, state, .Config.Image]),
+        (.[] | select(compose("project") == "") | ["-", "(none)", name, state, .Config.Image])
+        | @tsv' "$DOCKER_INVENTORY")"
     if [[ ! -t 1 ]]; then
         print_and_log "$header"$'\n'"$rows"
         return
     fi
     # Keep complete, unstyled TSV in the log, independent of terminal size.
     printf '%s\n%s\n' "$header" "$rows" >> "$LOG_FILE"
-    docker_render_inventory "$rows"
+    docker_render_inventory "$header" "$rows"
 }
 
+# Aligned columns when they fit the terminal, labeled entries otherwise; each project is named once.
 docker_render_inventory() {
-    local rows=$'#\tCONTAINER\tSTATE\tHEALTH\tIMAGE\tCOMPOSE PROJECT/SERVICE\n'"$1"
-    local column total=0 prefix
-    local -a widths=(0 0 0 0 0 0) cells=()
+    local header="$1" rows="$2" column total=0 previous='' prefix
+    local -a widths=(0 0 0 0 0) cells=()
     terminal_setup
     while IFS=$'\t' read -r -a cells; do
         for column in "${!widths[@]}"; do
@@ -100,166 +175,108 @@ docker_render_inventory() {
                 widths[column]="${#cells[column]}"
             fi
         done
-    done <<< "$rows"
+    done <<< "$header"$'\n'"$rows"
     # Each column has two spaces before it, including the left margin.
     for column in "${widths[@]}"; do total=$((total + column + 2)); done
 
-    printf '\n  %sContainers%s\n\n' "$TERMINAL_BOLD" "$TERMINAL_RESET"
+    printf '\n  %sContainers by Compose project%s\n\n' "$TERMINAL_BOLD" "$TERMINAL_RESET"
     if (( total <= TERMINAL_WIDTH - 2 )); then
         while IFS=$'\t' read -r -a cells; do
-            printf '  %*s' "${widths[0]}" "${cells[0]}"
-            for ((column = 1; column < 5; column++)); do
-                printf '  %-*s' "${widths[column]}" "${cells[column]}"
-            done
-            printf '  %s\n' "${cells[5]}"
-            if [[ "${cells[0]}" == '#' ]]; then
+            if [[ "${cells[0]}" == "$previous" ]]; then
+                cells[0]='' cells[1]=''
+            else
+                previous="${cells[0]}"
+            fi
+            printf '  %*s  %-*s  %-*s  %-*s  %s\n' "${widths[0]}" "${cells[0]}" "${widths[1]}" "${cells[1]}" \
+                "${widths[2]}" "${cells[2]}" "${widths[3]}" "${cells[3]}" "${cells[4]}"
+            if [[ "$previous" == '#' ]]; then
                 terminal_rule "$((total - 2))"
             fi
-        done <<< "$rows"
+        done <<< "$header"$'\n'"$rows"
     else
         while IFS=$'\t' read -r -a cells; do
-            printf -v prefix '  %*s) ' "${widths[0]}" "${cells[0]}"
-            terminal_wrap "$prefix" "${cells[1]}" "$((TERMINAL_WIDTH - 2))"
-            terminal_wrap '     State    ' "${cells[2]} (health: ${cells[3]})" "$((TERMINAL_WIDTH - 2))"
-            terminal_wrap '     Image    ' "${cells[4]}" "$((TERMINAL_WIDTH - 2))"
-            terminal_wrap '     Compose  ' "${cells[5]}" "$((TERMINAL_WIDTH - 2))"
+            if [[ "${cells[0]}" != "$previous" ]]; then
+                previous="${cells[0]}"
+                printf -v prefix '  %*s) ' "${widths[0]}" "${cells[0]}"
+                terminal_wrap "$prefix" "${cells[1]}" "$((TERMINAL_WIDTH - 2))"
+            fi
+            terminal_wrap '       Container  ' "${cells[2]}" "$((TERMINAL_WIDTH - 2))"
+            terminal_wrap '       State      ' "${cells[3]}" "$((TERMINAL_WIDTH - 2))"
+            terminal_wrap '       Image      ' "${cells[4]}" "$((TERMINAL_WIDTH - 2))"
             printf '\n'
-        done <<< "$1"
+        done <<< "$rows"
     fi
     printf '\n'
 }
 
-docker_select() {
-    local answer token count valid
+# Sets DOCKER_SELECTED to the chosen project names, in inventory order. Without a terminal, all are chosen.
+docker_select_projects() {
+    local answer token index count="${#DOCKER_PROJECTS[@]}" valid
     local -a numbers=()
-    count="$(jq length "$DOCKER_INVENTORY")"
-    cp -- "$DOCKER_INVENTORY" "$DOCKER_SELECTED"
-    (( count > 0 )) || return 0
+    DOCKER_SELECTED=("${DOCKER_PROJECTS[@]}")
     [[ -t 0 ]] || return 0
     while true; do
-        read -r -p 'Select containers (all, numbers separated by spaces/commas, or 0 to cancel): ' answer || answer=0
+        read -r -p 'Select projects (all, numbers separated by spaces/commas, or 0 to cancel): ' answer || answer=0
         case "$answer" in
             all) return 0 ;;
-            ''|0) printf '[]\n' > "$DOCKER_SELECTED"; return 0 ;;
+            ''|0) DOCKER_SELECTED=(); return 0 ;;
         esac
         read -r -a numbers <<< "${answer//,/ }"
         valid=1
         for token in "${numbers[@]}"; do
-            if [[ ! "$token" =~ ^[1-9][0-9]*$ || ${#token} -gt 9 ]] || (( token > count )); then
+            if [[ ! "$token" =~ ^[1-9][0-9]{0,8}$ ]] || (( token > count )); then
                 valid=0
                 break
             fi
         done
         if (( valid && ${#numbers[@]} > 0 )); then
-            jq --arg numbers "${numbers[*]}" '
-                . as $all | ($numbers | split(" ") | map(tonumber - 1) | unique) |
-                map($all[.])' "$DOCKER_INVENTORY" > "$DOCKER_SELECTED"
+            DOCKER_SELECTED=()
+            for index in "${!DOCKER_PROJECTS[@]}"; do
+                if [[ " ${numbers[*]} " == *" $((index + 1)) "* ]]; then
+                    DOCKER_SELECTED+=("${DOCKER_PROJECTS[index]}")
+                fi
+            done
             return 0
         fi
-        info "Choose all, 0, or container numbers from 1 to ${count}."
+        info "Choose all, 0, or project numbers from 1 to ${count}."
     done
 }
 
-action_list() {
-    docker_discover
-}
-
-docker_image_platform() {
-    local record="$1" platform image_id
-    platform="$(jq -r '.ImageManifestDescriptor.platform // empty |
-        .os + "/" + .architecture + (if .variant then "/" + .variant else "" end)' <<< "$record")"
-    if [[ -z "$platform" ]]; then
-        # Classic image stores do not expose a manifest descriptor on the container.
-        image_id="$(jq -r '.Image' <<< "$record")"
-        platform="$(docker_exec image inspect "$image_id" | jq -er '.[0] |
-            .Os + "/" + .Architecture + (if (.Variant // "") != "" then "/" + .Variant else "" end)')"
-    fi
-    if [[ ! "$platform" =~ ^[a-z0-9]+/[a-z0-9]+(/[a-zA-Z0-9._-]+)?$ ]]; then
-        error 'Cannot determine the deployed image platform.' >&2
-        return 1
-    fi
-    printf '%s\n' "$platform"
-}
-
-docker_pull_images() {
-    local file="$1" image record platform
-    jq -c 'unique_by([.Config.Image, .Image, .ImageManifestDescriptor.platform])[]' "$file" > "$TMP_DIR/pull-records"
-    : > "$TMP_DIR/pull-plan"
-    while IFS= read -r record; do
-        image="$(jq -r '.Config.Image' <<< "$record")"
-        if [[ "$image" == sha256:* || "$image" =~ ^[a-f0-9]{64}$ ]]; then
-            warn_condition "Skipping image ${image}: no registry reference is recorded."
-            continue
-        fi
-        platform="$(docker_image_platform "$record")"
-        printf '%s\t%s\n' "$image" "$platform" >> "$TMP_DIR/pull-plan"
-    done < "$TMP_DIR/pull-records"
-    sort -u "$TMP_DIR/pull-plan" > "$TMP_DIR/pulls"
-    while IFS=$'\t' read -r image platform; do
-        docker_run pull --platform "$platform" "$image"
-    done < "$TMP_DIR/pulls"
-}
-
-action_pull() {
-    docker_discover
-    docker_select
-    docker_pull_images "$DOCKER_SELECTED"
-    success 'Image pulls finished; no containers were restarted.'
-}
-
-# Populates the Compose command and service only after validating ownership and source files.
+# Sets DOCKER_COMPOSE to the command that deployed the project: its name, directory, Compose files,
+# and environment files as recorded on its containers. Snapshots those containers to DOCKER_PROJECT.
 docker_compose_context() {
-    local file="$1" project directory paths path environment_files
-    local -a files=()
-    project="$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // ""' "$file")"
-    DOCKER_SERVICE="$(jq -r '.[0].Config.Labels["com.docker.compose.service"] // ""' "$file")"
-    if [[ ! "$project" =~ ^[a-z0-9][a-z0-9_-]*$ || ! "$DOCKER_SERVICE" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
-        warn_condition 'Skipping container without valid Compose ownership; listing and pulling are still available.'
+    local project="$1" directory files environment_files path
+    local -a paths=()
+    jq --arg project "$project" "$DOCKER_JQ"'map(select(compose("project") == $project))' \
+        "$DOCKER_INVENTORY" > "$DOCKER_PROJECT"
+    if ! jq -e "$DOCKER_JQ"'length > 0 and
+        (map([compose("project.working_dir"), compose("project.config_files"), compose("project.environment_file")])
+            | unique | length == 1)' "$DOCKER_PROJECT" > /dev/null; then
+        warn_condition "Skipping ${project}: its containers are gone or were deployed from different Compose files."
         return 1
     fi
-    DOCKER_OWNER="${project}/${DOCKER_SERVICE}"
-    if ! jq -e 'all(.[]; (.Config.Labels["com.docker.compose.oneoff"] // "false" | ascii_downcase) == "false"
-        and .Config.Labels["com.docker.swarm.service.id"] == null
-        and (.State.Status == "running" or .State.Status == "exited" or .State.Status == "created"))' "$file" > /dev/null; then
-        warn_condition "Skipping ${DOCKER_OWNER}: one-off, Swarm, or transitional containers need their own lifecycle manager."
-        return 1
-    fi
-    if ! jq -e --slurpfile all "$DOCKER_INVENTORY" --arg project "$project" --arg service "$DOCKER_SERVICE" '
-        length == ([$all[0][] | select(.Config.Labels["com.docker.compose.project"] == $project and
-            .Config.Labels["com.docker.compose.service"] == $service)] | length)' "$file" > /dev/null; then
-        warn_condition "Skipping ${DOCKER_OWNER}: select all replicas of the service to update it."
-        return 1
-    fi
-    if ! jq -e '[.[] | [.State.Running, .Config.Image,
-        .ImageManifestDescriptor.platform,
-        .Config.Labels["com.docker.compose.project.config_files"],
-        .Config.Labels["com.docker.compose.project.working_dir"],
-        .Config.Labels["com.docker.compose.project.environment_file"]]] | unique | length == 1' "$file" > /dev/null; then
-        warn_condition "Skipping ${DOCKER_OWNER}: replicas have mixed states or source definitions."
-        return 1
-    fi
-    directory="$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // ""' "$file")"
-    paths="$(jq -r '.[0].Config.Labels["com.docker.compose.project.config_files"] // ""' "$file")"
-    environment_files="$(jq -r '.[0].Config.Labels["com.docker.compose.project.environment_file"] // ""' "$file")"
-    if [[ "$directory" != /* || ! -d "$directory" || -z "$paths" || "$paths$environment_files" == *$'\n'* ]]; then
-        warn_condition "Skipping ${DOCKER_OWNER}: the original Compose directory or file metadata is unavailable."
+    directory="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.working_dir")' "$DOCKER_PROJECT")"
+    files="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.config_files")' "$DOCKER_PROJECT")"
+    environment_files="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.environment_file")' "$DOCKER_PROJECT")"
+    if [[ "$directory" != /* || ! -d "$directory" || -z "$files" || "$directory$files$environment_files" == *$'\n'* ]]; then
+        warn_condition "Skipping ${project}: its recorded Compose directory or file list is unavailable: ${directory}"
         return 1
     fi
     DOCKER_COMPOSE=(compose --project-name "$project" --project-directory "$directory")
-    IFS=, read -r -a files <<< "$paths"
-    for path in "${files[@]}"; do
+    IFS=, read -r -a paths <<< "$files"
+    for path in "${paths[@]}"; do
         if [[ "$path" != /* || ! -r "$path" ]]; then
-            warn_condition "Skipping ${DOCKER_OWNER}: Compose file is unavailable: ${path}"
+            warn_condition "Skipping ${project}: Compose file is unavailable: ${path}"
             return 1
         fi
-        DOCKER_COMPOSE+=(-f "$path")
+        DOCKER_COMPOSE+=(--file "$path")
     done
     if [[ -n "$environment_files" ]]; then
-        IFS=, read -r -a files <<< "$environment_files"
-        for path in "${files[@]}"; do
+        IFS=, read -r -a paths <<< "$environment_files"
+        for path in "${paths[@]}"; do
             [[ "$path" == /* ]] || path="$directory/$path"
             if [[ ! -r "$path" ]]; then
-                warn_condition "Skipping ${DOCKER_OWNER}: environment file is unavailable: ${path}"
+                warn_condition "Skipping ${project}: environment file is unavailable: ${path}"
                 return 1
             fi
             DOCKER_COMPOSE+=(--env-file "$path")
@@ -267,121 +284,66 @@ docker_compose_context() {
     fi
 }
 
-# The service hash excludes top-level resources. Check their effective identities separately.
-docker_validate_resources() {
-    local file="$1"
-    if ! jq -e --slurpfile model "$TMP_DIR/config.json" --arg service "$DOCKER_SERVICE" '
-        def simple_resource:
-            .external == true or
-            (with_entries(select(.value != null and .value != {} and .value != [])) |
-                (keys - ["name", "external"]) | length == 0);
-        $model[0] as $cfg | $cfg.services[$service] as $s |
-        (($s.secrets // []) | length == 0) and (($s.configs // []) | length == 0) and
-        (($s.volumes_from // []) | length == 0) and
-        all([$s.network_mode, $s.ipc, $s.pid][]; . == null or (test("^(service|container):") | not)) and
-        all($s.volumes[]?; (.type == "bind" or .type == "volume" or .type == "tmpfs") and
-            (if .type == "volume" and .source then $cfg.volumes[.source] | simple_resource else true end)) and
-        all(($s.networks // {}) | keys[]; $cfg.networks[.] | simple_resource) and
-        all(.[]; . as $container |
-            all($s.volumes[]?; . as $volume |
-                any($container.Mounts[]; .Destination == $volume.target and .Type == $volume.type and
-                    .RW == (($volume.read_only // false) | not) and
-                    (if $volume.type == "bind" then .Source == $volume.source
-                     elif $volume.type == "volume" and $volume.source then .Name == $cfg.volumes[$volume.source].name
-                     else true end))) and
-            (($container.NetworkSettings.Networks | keys | sort) ==
-                (if $s.network_mode then [$s.network_mode] else
-                    [($s.networks // {}) | keys[] | $cfg.networks[.].name] | sort end)))
-        ' "$file" > /dev/null; then
-        warn_condition "Skipping ${DOCKER_OWNER}: resource identities differ or require project-managed updates (custom networks/volumes, secrets, configs, or shared namespaces)."
+# Confirms the project's Compose files still resolve, and shows any Compose warnings before the prompt.
+docker_check_project() {
+    local project="$1" messages="$TMP_DIR/compose-check"
+    docker_compose_context "$project" || return 1
+    if ! docker_exec "${DOCKER_COMPOSE[@]}" config --quiet > "$messages" 2>&1; then
+        tee -a "$LOG_FILE" < "$messages"
+        warn_condition "Skipping ${project}: its Compose files do not resolve; see the messages above."
         return 1
     fi
+    if [[ -s "$messages" ]]; then
+        tee -a "$LOG_FILE" < "$messages"
+        warn_condition "${project}: Compose reported the warnings above; review them before confirming."
+    fi
+    info "Ready: ${project} ($(jq -r "$DOCKER_JQ"'.[0] | compose("project.config_files") | gsub(","; ", ")' "$DOCKER_PROJECT"))"
 }
 
-docker_validate_config() {
-    local file="$1" hash expected_image configured_image
-    docker_compose_context "$file" || return 1
-    # Do not log rendered configuration: it can contain interpolated secrets.
-    if ! docker_exec "${DOCKER_COMPOSE[@]}" config --format json "$DOCKER_SERVICE" > "$TMP_DIR/config.json" 2> "$TMP_DIR/config-error" ||
-       ! hash="$(docker_exec "${DOCKER_COMPOSE[@]}" config --hash "$DOCKER_SERVICE" 2> "$TMP_DIR/config-error")"; then
-        warn_condition "Skipping ${DOCKER_OWNER}: Compose configuration cannot be resolved. Check its files and environment."
-        return 1
+# Converges every service without starting anything new, then restarts what was running before.
+docker_update_project() {
+    local project="$1" services
+    local -a running=()
+    # Read the state after the downloads, not at selection time: it may have changed meanwhile.
+    docker_load_inventory
+    docker_compose_context "$project" || return 0
+    services="$(jq -r "$DOCKER_JQ"'[.[] | select(service_container and .State.Running) | compose("service")]
+        | unique[]' "$DOCKER_PROJECT")"
+    docker_run "${DOCKER_COMPOSE[@]}" up --no-start --pull never --remove-orphans
+    if [[ -n "$services" ]]; then
+        mapfile -t running <<< "$services"
+        docker_run "${DOCKER_COMPOSE[@]}" up --detach --wait --wait-timeout "$DOCKER_WAIT_SECONDS" \
+            --pull never "${running[@]}"
     fi
-    hash="${hash##* }"
-    if [[ -z "$hash" ]] || ! jq -e --arg hash "$hash" 'all(.[]; .Config.Labels["com.docker.compose.config-hash"] == $hash)' "$file" > /dev/null; then
-        warn_condition "Skipping ${DOCKER_OWNER}: Compose settings differ from the deployed configuration; reconcile them explicitly first."
-        return 1
-    fi
-    expected_image="$(jq -r '.[0].Config.Image' "$file")"
-    configured_image="$(jq -r --arg service "$DOCKER_SERVICE" '.services[$service].image // ""' "$TMP_DIR/config.json")"
-    if [[ "$expected_image" != "$configured_image" || "$expected_image" == sha256:* ]] ||
-       jq -e --arg service "$DOCKER_SERVICE" '.services[$service].build != null' "$TMP_DIR/config.json" > /dev/null; then
-        warn_condition "Skipping ${DOCKER_OWNER}: the image is locally built or differs from the deployed reference."
-        return 1
-    fi
-    docker_validate_resources "$file"
+    docker_remove_replaced_images
+    success "${project}: updated from its Compose files; ${#running[@]} service(s) running."
 }
 
-action_update() {
-    local group index=0 file image local_id platform running count current
-    local -a eligible=() start_options=()
-    docker_discover
-    docker_select
-    [[ "$(jq length "$DOCKER_SELECTED")" != 0 ]] || return 0
-    docker_exec compose version > /dev/null
-    jq -c 'group_by([.Config.Labels["com.docker.compose.project"] // .Id,
-        .Config.Labels["com.docker.compose.service"] // .Id])[]' "$DOCKER_SELECTED" > "$TMP_DIR/groups"
-    while IFS= read -r group; do
-        file="$TMP_DIR/group-$index.json"
-        index=$((index + 1))
-        printf '%s\n' "$group" > "$file"
-        if docker_validate_config "$file"; then
-            eligible+=("$file")
-            info "Eligible: ${DOCKER_OWNER} ($(jq -r '.[0].State.Status' "$file"), $(jq length "$file") container(s))."
-        fi
-    done < "$TMP_DIR/groups"
-    if (( ${#eligible[@]} == 0 )); then
-        info 'No selected services can be updated safely from their recorded Compose definitions.'
-        return 0
-    fi
-    warn_note 'Changed images require container recreation. In-memory data, temporary storage, and writable container-layer changes are lost; persistent mounts are retained.'
-    warn_note 'Stopped services stay stopped. Dependencies, image tags, and Compose files are not changed.'
-    warn_note 'Compose is the source of truth. Record any manual docker update overrides in its files before proceeding.'
-    if ! confirm_phrase 'Pull and apply image updates for the eligible services?' UPDATE; then
-        info 'Update cancelled; no images pulled or containers changed.'
-        return 0
-    fi
-    # Complete every pull before the first recreation: a registry failure cannot leave a partially restarted group.
-    jq -s 'add' "${eligible[@]}" > "$TMP_DIR/eligible.json"
-    docker_pull_images "$TMP_DIR/eligible.json"
-    for file in "${eligible[@]}"; do
-        # Detect external recreation and source edits while the user was choosing or images were downloading.
-        docker_refresh_inventory
-        jq --slurpfile selected "$file" '[.[] | select(.Id as $id | any($selected[0][]; .Id == $id))]' \
-            "$DOCKER_INVENTORY" > "$TMP_DIR/current.json"
-        # Health checks may change normally; compare only the settings/state we rely on.
-        current='map({Id, Image, Config, running: .State.Running, status: .State.Status, HostConfig, Mounts}) | sort_by(.Id)'
-        if [[ "$(jq -cS "$current" "$file")" != "$(jq -cS "$current" "$TMP_DIR/current.json")" ]]; then
-            warn_condition 'Skipping service: its containers changed since discovery. Run the action again.'
+# Removes images that DOCKER_PROJECT's containers ran before the update once no container uses them,
+# provided every tag left on them is a reference the project itself used.
+docker_remove_replaced_images() {
+    local replaced id record tags
+    local -a ids=() targets=()
+    docker_load_inventory
+    replaced="$(jq -r --slurpfile now "$DOCKER_INVENTORY" '[.[].Image] - [$now[0][].Image] | unique[]' "$DOCKER_PROJECT")"
+    [[ -n "$replaced" ]] || return 0
+    mapfile -t ids <<< "$replaced"
+    for id in "${ids[@]}"; do
+        record="$(docker_exec image inspect "$id" 2> /dev/null)" || continue
+        if ! jq -e --slurpfile project "$DOCKER_PROJECT" "$DOCKER_JQ"'
+            [$project[0][].Config.Image | familiar] as $owned |
+            all(.[0].RepoTags[]?; familiar | IN($owned[]))' <<< "$record" > /dev/null; then
+            warn_note "Kept replaced image ${id}: it is also tagged $(jq -r '.[0].RepoTags | join(", ")' <<< "$record")."
             continue
         fi
-        docker_validate_config "$file" || continue
-        image="$(jq -r '.[0].Config.Image' "$file")"
-        platform="$(docker_image_platform "$(jq -c '.[0]' "$file")")"
-        local_id="$(docker_exec image inspect --platform "$platform" "$image" | jq -er '.[0].Id')"
-        if jq -e --arg image "$local_id" 'all(.[]; .Image == $image)' "$file" > /dev/null; then
-            success "${DOCKER_OWNER}: image unchanged; containers kept as they are."
-            continue
-        fi
-        count="$(jq length "$file")"
-        running="$(jq -r '.[0].State.Running' "$file")"
-        if [[ "$running" == true ]]; then
-            start_options=(-d --wait --wait-timeout "$DOCKER_WAIT_SECONDS")
+        tags="$(jq -r '.[0].RepoTags[]?' <<< "$record")"
+        if [[ -n "$tags" ]]; then
+            mapfile -t targets <<< "$tags"
         else
-            start_options=(--no-start)
+            targets=("$id")
         fi
-        docker_run "${DOCKER_COMPOSE[@]}" up "${start_options[@]}" --no-deps --no-build --pull never \
-            --remove-orphans=false --scale "$DOCKER_SERVICE=$count" "$DOCKER_SERVICE"
-        success "${DOCKER_OWNER}: image updated; ${count} container(s), previous running/stopped state preserved."
+        if ! docker_run image rm "${targets[@]}"; then
+            warn_condition "Could not remove replaced image ${id}; it was kept."
+        fi
     done
 }

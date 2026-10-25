@@ -22,6 +22,13 @@ def save():
 def fail(message, code=1):
     print(message, file=sys.stderr)
     sys.exit(code)
+def owner(container):
+    labels = container['Config']['Labels']
+    return labels.get('com.docker.compose.project'), labels.get('com.docker.compose.service')
+def tags(image_id):
+    return sorted(ref for ref, tagged in data['images'].items() if tagged == image_id)
+def in_use(image_id):
+    return any(container['Image'] == image_id for container in data['containers'])
 if args == ['context', 'show']:
     print('test-context')
 elif args[:2] == ['context', 'inspect']:
@@ -29,59 +36,78 @@ elif args[:2] == ['context', 'inspect']:
 elif args == ['info']:
     if data.get('denied') and not os.environ.get('FAKE_ROOT'):
         fail('permission denied')
-elif args[:2] == ['ps', '-aq']:
-    print('\n'.join(c['Id'] for c in data['containers']))
+elif args[:3] == ['ps', '--all', '--quiet']:
+    print('\n'.join(container['Id'] for container in data['containers']))
 elif args[0] == 'inspect':
-    found = [c for c in data['containers'] if c['Id'] in args[1:]]
+    found = [container for container in data['containers'] if container['Id'] in args[1:]]
     if len(found) != len(args[1:]):
         fail('container disappeared')
     print(json.dumps(found))
 elif args[:2] == ['image', 'inspect']:
-    image = data['images'].get(args[-1])
-    if image is None:
-        fail('image not found')
-    print(json.dumps([{'Id': image, 'Os': 'linux', 'Architecture': 'amd64'}]))
-elif args[0] == 'pull':
-    ref = args[-1]
-    if ref == data.get('pull_failure'):
-        fail('registry unavailable', 42)
-    data['images'][ref] = data['registry'].get(ref, data['images'].get(ref))
-    if data.get('change_during_pull') == 'state':
-        data['containers'][0]['State'] = {'Status': 'exited', 'Running': False}
-    if data.get('change_during_pull') == 'config':
-        next(iter(data['services'].values()))['hash'] = 'changed-after-confirmation'
-    if data.get('change_during_pull') == 'replica' and len(data['containers']) == 1:
-        replica = json.loads(json.dumps(data['containers'][0]))
-        replica.update(Id='new-replica-id', Name='/new-replica')
-        data['containers'].append(replica)
+    if args[2] not in data['store']:
+        fail('No such image')
+    print(json.dumps([{'Id': args[2], 'RepoTags': tags(args[2])}]))
+elif args[:2] == ['image', 'rm']:
+    for target in args[2:]:
+        image_id = data['images'].get(target, target)
+        if in_use(image_id):
+            fail('conflict: image is being used by a container')
+        if target in data['images']:
+            del data['images'][target]
+        elif tags(image_id):
+            fail('conflict: image is referenced in multiple repositories')
+        if not tags(image_id):
+            data['store'].remove(image_id)
     save()
-    print('Pulled ' + ref)
+    print('Deleted')
 elif args[:2] == ['compose', 'version']:
     print('Docker Compose version test')
 elif args[0] == 'compose':
-    for option in ('--project-name', '--project-directory', '-f'):
-        if option not in args:
-            fail('missing Compose context: ' + option)
-    project = args[args.index('--project-name') + 1]
-    service = args[-1]
-    spec = data['services'][project + '/' + service]
-    if 'config' in args and '--hash' in args:
-        print(service + ' ' + spec['hash'])
-    elif 'config' in args and '--format' in args:
-        print(json.dumps({'services': {service: spec['config']},
-            'volumes': data.get('volumes', {}),
-            'networks': data.get('networks', {'default': {'name': project + '_default', 'ipam': {}}})}))
-    elif 'up' in args:
-        if data.get('up_failure'):
-            fail('health check failed', 43)
-        for container in data['containers']:
-            labels = container['Config']['Labels']
-            if labels.get('com.docker.compose.project') == project and labels.get('com.docker.compose.service') == service:
-                container['Image'] = data['images'][container['Config']['Image']]
-                container['State']['Status'] = 'created' if '--no-start' in args else 'running'
-                container['State']['Running'] = '--no-start' not in args
+    args = args[1:]
+    context = {}
+    while args[0] in ('--project-name', '--project-directory', '--file', '--env-file'):
+        context.setdefault(args[0], []).append(args[1])
+        args = args[2:]
+    if '--project-name' not in context or '--project-directory' not in context or '--file' not in context:
+        fail('missing Compose context: ' + repr(context))
+    project = context['--project-name'][0]
+    services = data['projects'][project]
+    command = args[0]
+    members = [c for c in data['containers'] if owner(c)[0] == project]
+    if command == 'config':
+        if data.get('config_error') == project:
+            fail('services.api.image: invalid reference')
+    elif command == 'pull':
+        for ref in sorted(set(services.values())):
+            if ref == data.get('pull_failure'):
+                fail('registry unavailable', 42)
+            data['images'][ref] = data['registry'].get(ref, data['images'].get(ref))
+            if data['images'][ref] not in data['store']:
+                data['store'].append(data['images'][ref])
+        if data.get('change_during_pull') == 'stop':
+            for container in members:
+                container['State'] = {'Status': 'exited', 'Running': False}
         save()
-        print('Recreated ' + service)
+    elif command == 'up' and '--no-start' in args:
+        if '--remove-orphans' in args:
+            data['containers'] = [c for c in data['containers'] if c not in members or owner(c)[1] in services]
+        for container in data['containers']:
+            name, service = owner(container)
+            if name == project and service in services:
+                ref = services[service]
+                if container['Image'] != data['images'][ref] or container['Config']['Image'] != ref:
+                    container['Id'] += '-recreated'
+                    container['Image'] = data['images'][ref]
+                    container['Config']['Image'] = ref
+                    container['State'] = {'Status': 'created', 'Running': False}
+        save()
+    elif command == 'up' and '--detach' in args and '--wait' in args:
+        if data.get('up_failure'):
+            fail('container is unhealthy', 43)
+        for container in members:
+            if owner(container)[1] in args:
+                container['State'] = {'Status': 'running', 'Running': True}
+        save()
     else:
         fail('unexpected Compose command: ' + repr(args))
 else:
@@ -105,181 +131,252 @@ class DockerTests(unittest.TestCase):
             self.env.pop(key, None)
         self.command('docker', FAKE_DOCKER)
         self.command('sudo', '#!/bin/bash\nif [[ "$1" == -v ]]; then exit 0; fi\nexport FAKE_ROOT=1\nexec "$@"\n')
-        self.project = self.root / 'arbitrary project'
-        self.project.mkdir(exist_ok=True)
-        self.compose = self.project / 'compose.yaml'
-        self.compose.write_text('services: {}\n')
-        self.data = {'containers': [], 'images': {}, 'registry': {}, 'services': {}}
+        self.data = {'containers': [], 'images': {}, 'store': [], 'registry': {}, 'projects': {}}
 
-    def add_container(self, name='worker', service='api', project='sample', running=True,
+    def compose_file(self, project):
+        directory = self.root / 'projects with spaces' / project
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / 'compose.yaml'
+        path.write_text('services: {}\n')
+        return path
+
+    def add_container(self, name, project='sample', service='api', running=True,
                       image='example/app:latest', managed=True):
         labels = {}
         if managed:
+            compose = self.compose_file(project)
             labels = {
                 'com.docker.compose.project': project,
                 'com.docker.compose.service': service,
-                'com.docker.compose.project.config_files': str(self.compose),
-                'com.docker.compose.project.working_dir': str(self.project),
-                'com.docker.compose.config-hash': 'same-hash',
+                'com.docker.compose.project.config_files': str(compose),
+                'com.docker.compose.project.working_dir': str(compose.parent),
                 'com.docker.compose.oneoff': 'False',
             }
-            self.data['services'][project + '/' + service] = {
-                'hash': 'same-hash', 'config': {'image': image, 'networks': {'default': None}}}
-        container = {'Id': name + '-id', 'Name': '/' + name, 'Image': 'sha256:old',
+            self.data['projects'].setdefault(project, {})[service] = image
+        old, new = 'sha256:old-' + image, 'sha256:new-' + image
+        container = {'Id': name + '-id', 'Name': '/' + name, 'Image': old,
             'Config': {'Image': image, 'Labels': labels},
-            'State': {'Status': 'running' if running else 'exited', 'Running': running},
-            'Mounts': [], 'HostConfig': {'Tmpfs': {}, 'RestartPolicy': {'Name': 'no'}},
-            'NetworkSettings': {'Networks': {project + '_default': {}}},
-            'ImageManifestDescriptor': {'platform': {'os': 'linux', 'architecture': 'amd64'}}}
+            'State': {'Status': 'running' if running else 'exited', 'Running': running}}
         self.data['containers'].append(container)
-        self.data['images'][image] = 'sha256:old'
-        self.data['registry'][image] = 'sha256:new'
+        self.data['images'][image] = old
+        self.data['registry'][image] = new
+        if old not in self.data['store']:
+            self.data['store'].append(old)
         return container
 
     def save(self):
         self.fixture.write_text(json.dumps(self.data))
 
+    def saved(self):
+        return json.loads(self.fixture.read_text())
+
     def calls(self):
+        if not self.docker_trace.exists():
+            return []
         return [json.loads(line) for line in self.docker_trace.read_text().splitlines()]
 
-    def operations(self, operation):
-        return [call for call in self.calls() if operation in call]
+    def operations(self, *words):
+        return [call for call in self.calls() if all(word in call for word in words)]
 
-    def update(self, selection='all', response='UPDATE'):
+    def mutations(self):
+        return self.operations('pull') + self.operations('up') + self.operations('rm')
+
+    def update(self, selection='all', answer='y'):
         self.save()
         return self.terminal_run(self.entry_point, 'docker', 'update', replies=(
-            ('Select containers', selection + '\n'), ('Type UPDATE', response + '\n')))
+            ('Select projects', selection + '\n'), ('Compose project(s)?', answer + '\n')))
 
-    def test_module_registers_without_docker_access(self):
+    def test_module_registers_list_and_update_without_docker_access(self):
         result = self.maint('list')
         self.assertEqual(result.returncode, 0, result.stderr)
-        for action in ('list', 'pull', 'update'):
-            self.assertIn('docker\t' + action + '\tDocker\t', result.stdout)
+        actions = [line.split('\t')[1] for line in result.stdout.splitlines() if line.startswith('docker\t')]
+        self.assertEqual(actions, ['list', 'update'])
         self.assertFalse(self.trace.exists())
 
-    def test_list_discovers_and_sorts_running_stopped_and_unmanaged_containers(self):
+    def test_list_numbers_projects_in_name_order_and_changes_nothing(self):
         self.setup_docker()
-        self.add_container('zeta', running=False)
-        self.add_container('alpha', managed=False)
+        self.add_container('web', project='beta', running=False)
+        self.add_container('loose', managed=False, image='example/loose:1')
+        self.add_container('db', project='alpha', service='db', image='example/db:1')
         self.save()
         result = self.maint('docker', 'list')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(result.stdout.index('alpha'), result.stdout.index('zeta'))
-        self.assertIn('exited', result.stdout)
-        self.assertIn('example/app:latest', result.stdout)
-        self.assertFalse(self.operations('pull'))
-        self.assertFalse(self.operations('up'))
+        self.assertIn('1\talpha\tdb\trunning\texample/db:1', result.stdout)
+        self.assertIn('2\tbeta\tweb\texited\texample/app:latest', result.stdout)
+        self.assertIn('-\t(none)\tloose\trunning\texample/loose:1', result.stdout)
+        self.assertFalse(self.mutations())
 
     def test_empty_daemon_is_successful(self):
         self.setup_docker()
         self.save()
-        for action in ('list', 'pull', 'update'):
+        for action in ('list', 'update'):
             result = self.maint('docker', action)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('No containers', result.stdout)
 
-    def test_pull_deduplicates_images_and_never_restarts_containers(self):
+    def test_update_applies_recorded_compose_context_and_keeps_stopped_services_stopped(self):
         self.setup_docker()
-        self.add_container('one')
-        self.add_container('two', managed=False)
-        self.save()
-        result = self.maint('docker', 'pull')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.operations('pull')), 1)
-        self.assertFalse(self.operations('up'))
-        saved = json.loads(self.fixture.read_text())
-        self.assertEqual(saved['images']['example/app:latest'], 'sha256:new')
-        self.assertEqual(saved['containers'][0]['Image'], 'sha256:old')
-
-    def test_noninteractive_update_does_not_mutate(self):
-        self.setup_docker()
-        self.add_container()
-        self.save()
-        result = self.maint('docker', 'update', input='UPDATE\n')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(self.operations('pull'))
-        self.assertFalse(self.operations('up'))
-
-    def test_update_uses_original_files_and_preserves_stopped_state(self):
-        self.setup_docker()
-        active = self.add_container('active', service='api')
-        self.add_container('idle', service='jobs', running=False, image='example/jobs:alpine')
-        override = self.project / 'extra settings.yaml'
+        api = self.add_container('api')
+        self.add_container('jobs', service='jobs', running=False, image='example/jobs:1')
+        self.add_container('idle', project='idle', running=False, image='example/idle:1')
+        override = self.root / 'override settings.yaml'
         override.write_text('services: {}\n')
-        env_file = self.project / 'settings.env'
+        env_file = self.root / 'settings.env'
         env_file.write_text('SECRET=test\n')
-        active['Config']['Labels']['com.docker.compose.project.config_files'] += ',' + str(override)
-        active['Config']['Labels']['com.docker.compose.project.environment_file'] = str(env_file)
+        for container in self.data['containers'][:2]:
+            labels = container['Config']['Labels']
+            labels['com.docker.compose.project.config_files'] += ',' + str(override)
+            labels['com.docker.compose.project.environment_file'] = str(env_file)
         status, output = self.update()
         self.assertEqual(status, 0, output)
-        updates = self.operations('up')
-        self.assertEqual(len(updates), 2, output)
-        api = next(call for call in updates if call[-1] == 'api')
-        jobs = next(call for call in updates if call[-1] == 'jobs')
-        self.assertIn(str(override), api)
-        self.assertIn(str(env_file), api)
-        self.assertIn('--no-deps', api)
-        self.assertIn('--no-build', api)
-        self.assertIn('--wait', api)
-        self.assertIn('--no-start', jobs)
-        self.assertNotIn('--wait', jobs)
+        converge = self.operations('up', '--no-start', 'sample')[0]
+        files = [converge[i + 1] for i, word in enumerate(converge) if word == '--file']
+        self.assertEqual(files, [api['Config']['Labels']['com.docker.compose.project.config_files'].split(',')[0],
+            str(override)])
+        self.assertIn(str(env_file), converge)
+        started = self.operations('up', '--detach')
+        self.assertEqual(len(started), 1, output)
+        self.assertIn('api', started[0])
+        self.assertNotIn('jobs', started[0])
         self.assertNotIn('SECRET=test', output)
-        saved = json.loads(self.fixture.read_text())
-        self.assertTrue(saved['containers'][0]['State']['Running'])
-        self.assertFalse(saved['containers'][1]['State']['Running'])
+        states = {c['Name']: (c['State']['Running'], c['Image']) for c in self.saved()['containers']}
+        self.assertEqual(states, {'/api': (True, 'sha256:new-example/app:latest'),
+            '/jobs': (False, 'sha256:new-example/jobs:1'), '/idle': (False, 'sha256:new-example/idle:1')})
 
-    def test_update_skips_unchanged_images(self):
+    def test_every_project_is_pulled_before_any_project_changes(self):
         self.setup_docker()
-        self.add_container()
-        self.data['registry']['example/app:latest'] = 'sha256:old'
+        self.add_container('one', project='alpha')
+        self.add_container('two', project='beta', image='example/other:1')
         status, output = self.update()
         self.assertEqual(status, 0, output)
-        self.assertFalse(self.operations('up'))
-        self.assertIn('unchanged', output.lower())
+        calls = self.calls()
+        pulls = [i for i, call in enumerate(calls) if 'pull' in call]
+        changes = [i for i, call in enumerate(calls) if 'up' in call or 'rm' in call]
+        self.assertEqual(len(pulls), 2, output)
+        self.assertLess(max(pulls), min(changes))
 
-    def test_missing_compose_files_or_changed_settings_are_not_applied(self):
-        for mode in ('missing', 'drift', 'unmanaged'):
+    def test_pull_failure_leaves_every_project_untouched(self):
+        self.setup_docker()
+        self.add_container('one', project='alpha')
+        self.add_container('two', project='beta', image='example/other:1')
+        self.data['pull_failure'] = 'example/other:1'
+        status, output = self.update()
+        self.assertEqual(status, 42, output)
+        self.assertIn('registry unavailable', output)
+        self.assertFalse(self.operations('up'))
+        self.assertFalse(self.operations('rm'))
+
+    def test_replaced_images_are_removed_only_when_unused_and_owned(self):
+        old = 'sha256:old-example/app:latest'
+        for mode in ('dangling', 'retagged', 'in-use', 'foreign-tag'):
             with self.subTest(mode=mode):
                 self.setup_docker()
-                container = self.add_container(managed=mode != 'unmanaged')
-                if mode == 'missing':
-                    container['Config']['Labels']['com.docker.compose.project.config_files'] = '/missing/compose.yaml'
-                if mode == 'drift':
-                    self.data['services']['sample/api']['hash'] = 'different-hash'
+                self.add_container('api')
+                if mode == 'retagged':
+                    self.data['projects']['sample']['api'] = 'example/app:2'
+                    self.data['registry']['example/app:2'] = 'sha256:app-2'
+                if mode == 'in-use':
+                    self.add_container('manual', managed=False)
+                if mode == 'foreign-tag':
+                    self.data['images']['backup/app:keep'] = old
+                status, output = self.update()
+                self.assertEqual(status, 0, output)
+                saved = self.saved()
+                self.assertEqual(old in saved['store'], mode in ('in-use', 'foreign-tag'), output)
+                if mode == 'foreign-tag':
+                    self.assertIn('backup/app:keep', output)
+                    self.assertEqual(saved['images']['backup/app:keep'], old)
+
+    def test_containers_of_services_removed_from_compose_are_deleted_within_the_project_only(self):
+        self.setup_docker()
+        self.add_container('api')
+        self.add_container('retired', service='retired', image='example/retired:1')
+        self.add_container('neighbor', project='neighbor', image='example/neighbor:1')
+        self.add_container('manual', managed=False, image='example/manual:1')
+        del self.data['projects']['sample']['retired']
+        status, output = self.update(selection='2')
+        self.assertEqual(status, 0, output)
+        names = {c['Name'] for c in self.saved()['containers']}
+        self.assertEqual(names, {'/api', '/neighbor', '/manual'})
+
+    def test_selection_limits_every_change_to_the_chosen_projects(self):
+        self.setup_docker()
+        self.add_container('one', project='alpha')
+        self.add_container('two', project='beta', image='example/other:1')
+        status, output = self.update(selection='2')
+        self.assertEqual(status, 0, output)
+        compose_calls = [call for call in self.calls() if 'compose' in call and 'version' not in call]
+        self.assertTrue(compose_calls)
+        self.assertTrue(all('beta' in call for call in compose_calls))
+        self.assertEqual(self.saved()['containers'][0]['Image'], 'sha256:old-example/app:latest')
+
+    def test_noninteractive_or_declined_update_changes_nothing(self):
+        for mode in ('noninteractive', 'declined'):
+            with self.subTest(mode=mode):
+                self.setup_docker()
+                self.add_container('api')
+                self.save()
+                if mode == 'noninteractive':
+                    result = self.maint('docker', 'update', input='all\ny\n')
+                    status, output = result.returncode, result.stdout
+                else:
+                    status, output = self.update(answer='n')
+                self.assertEqual(status, 0, output)
+                self.assertIn('nothing was changed', output)
+                self.assertFalse(self.mutations())
+
+    def test_projects_that_cannot_be_reproduced_are_skipped_without_changes(self):
+        for mode in ('missing-file', 'missing-env', 'mixed-sources', 'unresolved'):
+            with self.subTest(mode=mode):
+                self.setup_docker()
+                api = self.add_container('api')
+                worker = self.add_container('worker', service='worker')
+                labels = api['Config']['Labels']
+                if mode == 'missing-file':
+                    for container in (api, worker):
+                        container['Config']['Labels']['com.docker.compose.project.config_files'] = '/missing/compose.yaml'
+                if mode == 'missing-env':
+                    for container in (api, worker):
+                        container['Config']['Labels']['com.docker.compose.project.environment_file'] = 'absent.env'
+                if mode == 'mixed-sources':
+                    labels['com.docker.compose.project.config_files'] += ',' + labels['com.docker.compose.project.config_files']
+                if mode == 'unresolved':
+                    self.data['config_error'] = 'sample'
                 self.save()
                 result = self.maint('docker', 'update')
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('Skip', result.stdout)
-                self.assertFalse(self.operations('pull'))
-                self.assertFalse(self.operations('up'))
+                self.assertIn('Skipping sample', result.stdout)
+                self.assertFalse(self.mutations())
 
-    def test_pull_failure_stops_before_any_recreation(self):
+    def test_containers_outside_compose_are_never_updated(self):
         self.setup_docker()
-        self.add_container('a')
-        self.add_container('b', service='other', image='example/other:latest')
-        self.data['pull_failure'] = 'example/other:latest'
-        status, output = self.update()
-        self.assertNotEqual(status, 0, output)
-        self.assertIn('registry unavailable', output)
-        self.assertFalse(self.operations('up'))
+        self.add_container('manual', managed=False)
+        self.save()
+        result = self.maint('docker', 'update')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('No Compose projects', result.stdout)
+        self.assertFalse(self.mutations())
 
-    def test_replicas_are_updated_once_with_the_same_count(self):
+    def test_running_state_is_read_after_the_downloads(self):
         self.setup_docker()
-        self.add_container('one')
-        self.add_container('two')
+        self.add_container('api')
+        self.data['change_during_pull'] = 'stop'
         status, output = self.update()
         self.assertEqual(status, 0, output)
-        self.assertEqual(len(self.operations('up')), 1)
-        self.assertIn('api=2', self.operations('up')[0])
+        self.assertFalse(self.operations('up', '--detach'))
+        self.assertFalse(self.saved()['containers'][0]['State']['Running'])
 
-    def test_partial_replica_selection_is_not_expanded_silently(self):
+    def test_health_failure_stops_remaining_projects_and_keeps_old_images(self):
         self.setup_docker()
-        self.add_container('one')
-        self.add_container('two')
-        status, output = self.update(selection='1')
-        self.assertEqual(status, 0, output)
-        self.assertFalse(self.operations('up'))
-        self.assertIn('replicas', output)
+        self.add_container('one', project='alpha')
+        self.add_container('two', project='beta', image='example/other:1')
+        self.data['up_failure'] = True
+        status, output = self.update()
+        self.assertEqual(status, 43, output)
+        self.assertIn('container is unhealthy', output)
+        self.assertEqual(len(self.operations('up', '--detach')), 1)
+        self.assertFalse(self.operations('beta', 'up'))
+        self.assertFalse(self.operations('rm'))
 
     def test_remote_context_is_not_replaced_by_local_sudo_docker(self):
         self.setup_docker()
@@ -290,80 +387,9 @@ class DockerTests(unittest.TestCase):
         self.assertIn('local', result.stdout.lower())
         self.assertFalse(self.operations('info'))
 
-    def test_cancelled_update_has_no_mutations(self):
-        self.setup_docker()
-        self.add_container()
-        status, output = self.update(response='update')
-        self.assertEqual(status, 0, output)
-        self.assertFalse(self.operations('pull'))
-        self.assertFalse(self.operations('up'))
-
-    def test_external_state_or_config_change_during_pull_is_not_overwritten(self):
-        for change in ('state', 'config'):
-            with self.subTest(change=change):
-                self.setup_docker()
-                self.add_container()
-                self.data['change_during_pull'] = change
-                status, output = self.update()
-                self.assertEqual(status, 0, output)
-                self.assertIn('Skipping', output)
-                self.assertFalse(self.operations('up'))
-
-    def test_selection_pulls_only_selected_image(self):
-        self.setup_docker()
-        self.add_container('alpha', image='example/alpha:latest')
-        self.add_container('beta', image='example/beta:latest')
-        self.save()
-        status, output = self.terminal_run(self.entry_point, 'docker', 'pull',
-            replies=(('Select containers', '2\n'),))
-        self.assertEqual(status, 0, output)
-        self.assertEqual([call[-1] for call in self.operations('pull')], ['example/beta:latest'])
-
-    def test_health_failure_stops_remaining_services(self):
-        self.setup_docker()
-        self.add_container('one')
-        self.add_container('two', service='worker', image='example/worker:latest')
-        self.data['up_failure'] = True
-        status, output = self.update()
-        self.assertEqual(status, 43, output)
-        self.assertIn('health check failed', output)
-        self.assertEqual(len(self.operations('up')), 1)
-
-    def test_mixed_replica_states_and_oneoff_containers_are_skipped(self):
-        for mode in ('mixed', 'oneoff', 'swarm', 'paused', 'build'):
-            with self.subTest(mode=mode):
-                self.setup_docker()
-                container = self.add_container('one')
-                if mode == 'mixed':
-                    self.add_container('two', running=False)
-                if mode == 'oneoff':
-                    container['Config']['Labels']['com.docker.compose.oneoff'] = 'True'
-                if mode == 'swarm':
-                    container['Config']['Labels']['com.docker.swarm.service.id'] = 'service-id'
-                if mode == 'paused':
-                    container['State']['Status'] = 'paused'
-                if mode == 'build':
-                    self.data['services']['sample/api']['config']['build'] = {'context': '.'}
-                self.save()
-                result = self.maint('docker', 'update')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('Skipping', result.stdout)
-                self.assertFalse(self.operations('pull'))
-                self.assertFalse(self.operations('up'))
-
-    def test_numeric_and_digest_tags_are_not_rewritten(self):
-        self.setup_docker()
-        self.add_container('numeric', image='example/app:2.0')
-        self.add_container('digest', service='other', image='example/app@sha256:' + 'a' * 64)
-        status, output = self.update()
-        self.assertEqual(status, 0, output)
-        self.assertEqual({call[-1] for call in self.operations('pull')},
-            {'example/app:2.0', 'example/app@sha256:' + 'a' * 64})
-        self.assertEqual(self.compose.read_text(), 'services: {}\n')
-
     def test_permission_fallback_keeps_selected_socket(self):
         self.setup_docker()
-        self.add_container()
+        self.add_container('api')
         self.data['denied'] = True
         self.save()
         result = self.maint('docker', 'list')
@@ -371,79 +397,6 @@ class DockerTests(unittest.TestCase):
         operations = [call for call in self.calls() if 'context' not in call]
         self.assertTrue(operations)
         self.assertTrue(all('unix:///test/docker.sock' in call for call in operations))
-
-    def test_replica_added_during_pull_is_not_removed_by_stale_scale(self):
-        self.setup_docker()
-        self.add_container()
-        self.data['change_during_pull'] = 'replica'
-        status, output = self.update()
-        self.assertEqual(status, 0, output)
-        self.assertFalse(self.operations('up'))
-        self.assertIn('replicas', output)
-
-    def test_shared_image_is_pulled_and_compared_for_each_deployed_platform(self):
-        self.setup_docker()
-        self.add_container('native')
-        foreign = self.add_container('foreign', service='foreign')
-        foreign['ImageManifestDescriptor']['platform']['architecture'] = 'arm64'
-        self.data['services']['sample/foreign']['config']['platform'] = 'linux/arm64'
-        status, output = self.update()
-        self.assertEqual(status, 0, output)
-        pulls = self.operations('pull')
-        self.assertEqual(len(pulls), 2, output)
-        self.assertEqual({call[call.index('--platform') + 1] for call in pulls},
-            {'linux/amd64', 'linux/arm64'})
-        image_inspects = [call for call in self.calls() if 'image' in call and 'inspect' in call]
-        self.assertTrue(all('--platform' in call for call in image_inspects))
-
-    def test_classic_image_store_platform_is_resolved_from_installed_image(self):
-        self.setup_docker()
-        container = self.add_container()
-        del container['ImageManifestDescriptor']
-        self.data['images']['sha256:old'] = 'sha256:old'
-        status, output = self.update()
-        self.assertEqual(status, 0, output)
-        self.assertEqual(len(self.operations('pull')), 1, output)
-        self.assertIn('linux/amd64', self.operations('pull')[0])
-
-    def test_top_level_resource_drift_is_rejected_even_with_matching_service_hash(self):
-        for mode in ('volume', 'network', 'network-options', 'secrets', 'configs'):
-            with self.subTest(mode=mode):
-                self.setup_docker()
-                container = self.add_container()
-                spec = self.data['services']['sample/api']['config']
-                if mode == 'volume':
-                    spec['volumes'] = [{'type': 'volume', 'source': 'data', 'target': '/data'}]
-                    self.data['volumes'] = {'data': {'name': 'different_data'}}
-                    container['Mounts'] = [{'Type': 'volume', 'Name': 'original_data',
-                        'Destination': '/data', 'RW': True}]
-                if mode == 'network':
-                    self.data['networks'] = {'default': {'name': 'other_network'}}
-                if mode == 'network-options':
-                    self.data['networks'] = {'default': {'name': 'sample_default', 'internal': True}}
-                if mode in ('secrets', 'configs'):
-                    spec[mode] = [{'source': 'credentials'}]
-                self.save()
-                result = self.maint('docker', 'update')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('Skipping', result.stdout)
-                self.assertFalse(self.operations('pull'))
-                self.assertFalse(self.operations('up'))
-
-    def test_matching_persistent_mounts_and_external_network_are_supported(self):
-        self.setup_docker()
-        container = self.add_container()
-        self.data['services']['sample/api']['config']['volumes'] = [
-            {'type': 'volume', 'source': 'data', 'target': '/data'},
-            {'type': 'bind', 'source': '/srv/config', 'target': '/config', 'read_only': True}]
-        self.data['volumes'] = {'data': {'name': 'original_data'}}
-        self.data['networks'] = {'default': {'name': 'sample_default', 'external': True}}
-        container['Mounts'] = [
-            {'Type': 'volume', 'Name': 'original_data', 'Destination': '/data', 'RW': True},
-            {'Type': 'bind', 'Source': '/srv/config', 'Destination': '/config', 'RW': False}]
-        status, output = self.update()
-        self.assertEqual(status, 0, output)
-        self.assertEqual(len(self.operations('up')), 1, output)
 
 
 if __name__ == '__main__':
