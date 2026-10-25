@@ -91,7 +91,9 @@ elif args[0] == 'compose':
     services = data['projects'][project]
     command = args[0]
     members = [c for c in data['containers'] if owner(c)[0] == project and not oneoff(c)]
-    if command == 'config' and '--hash' in args:
+    if command == 'config' and '--services' in args:
+        print('\n'.join(services))
+    elif command == 'config' and '--hash' in args:
         for service in services:
             print(service, data['hashes'].get(project + '/' + service, 'same-hash'))
     elif command == 'config' and '--format' in args:
@@ -126,6 +128,15 @@ elif args[0] == 'compose':
                     container['State'] = {'Status': 'created', 'Running': False}
         save()
     elif command == 'up' and '--detach' in args and '--wait' in args:
+        targets, rest = [], args[1:]
+        while rest:
+            skip = 2 if rest[0] in ('--wait-timeout', '--pull') else 1
+            if not rest[0].startswith('--'):
+                targets.append(rest[0])
+            rest = rest[skip:]
+        unknown = [target for target in targets if target not in services]
+        if unknown:
+            fail('no such service: ' + unknown[0])
         if data.get('up_failure'):
             fail('container is unhealthy', 43)
         for container in members:
@@ -266,9 +277,21 @@ class DockerTests(unittest.TestCase):
         self.assertIn('api', started[0])
         self.assertNotIn('jobs', started[0])
         self.assertNotIn('SECRET=test', output)
+        self.assertIn('sample: 2 containers recreated, 2 old images removed. Running: api.', output)
+        self.assertIn('idle: 1 container recreated, 1 old image removed. Stopped, as before.', output)
         states = {c['Name']: (c['State']['Running'], c['Image']) for c in self.saved()['containers']}
         self.assertEqual(states, {'/api': (True, 'sha256:new-example/app:latest'),
             '/jobs': (False, 'sha256:new-example/jobs:1'), '/idle': (False, 'sha256:new-example/idle:1')})
+
+    def test_project_without_newer_images_or_edits_is_reported_up_to_date(self):
+        self.setup_docker()
+        self.add_container('api')
+        self.data['registry']['example/app:latest'] = 'sha256:old-example/app:latest'
+        status, output = self.update()
+        self.assertEqual(status, 0, output)
+        self.assertIn('sample: already up to date, nothing changed. Running: api.', output)
+        self.assertEqual([c['Id'] for c in self.saved()['containers']], ['api-id'])
+        self.assertFalse(self.operations('rm'))
 
     def test_every_project_is_pulled_before_any_project_changes(self):
         self.setup_docker()
@@ -325,6 +348,7 @@ class DockerTests(unittest.TestCase):
         self.assertEqual(status, 0, output)
         names = {c['Name'] for c in self.saved()['containers']}
         self.assertEqual(names, {'/api', '/neighbor', '/manual'})
+        self.assertIn('sample: 1 container recreated, 1 container removed, 2 old images removed. Running: api.', output)
 
     def test_settings_changes_and_removals_are_named_before_confirmation(self):
         self.setup_docker()
@@ -354,6 +378,8 @@ class DockerTests(unittest.TestCase):
         status, output = self.update()
         self.assertEqual(status, 0, output)
         self.assertIn('no warning conditions', output)
+        self.assertIn('sample: 1 container recreated, 1 leftover container removed, 1 unused network removed. '
+            'Stopped, as before.', output)
         saved = self.saved()
         self.assertEqual({c['Name']: c['State']['Running'] for c in saved['containers']},
             {'/api': False, '/run-live': True})

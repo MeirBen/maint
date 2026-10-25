@@ -67,6 +67,7 @@ action_update() {
         return 0
     fi
     # Download everything first: a registry failure must leave every project untouched.
+    info 'Checking for newer images. Nothing changes until every download has finished.'
     for project in "${ready[@]}"; do
         if ! docker_compose_context "$project"; then
             error "Stopping before any change: ${project} can no longer be reproduced."
@@ -328,27 +329,75 @@ docker_show_changes() {
 # Converges every service without starting anything new, restarts what was running before,
 # then removes what the update left unused.
 docker_update_project() {
-    local project="$1" services
+    local project="$1" defined services
     local -a running=()
+    DOCKER_CHANGES=()
+    info "${project}: applying its Compose files..."
     # Read the state after the downloads, not at selection time: it may have changed meanwhile.
     docker_load_inventory
     docker_compose_context "$project" || return 0
-    services="$(jq -r "$DOCKER_JQ"'[.[] | select(service_container and .State.Running) | compose("service")]
-        | unique[]' "$DOCKER_PROJECT")"
+    # A running service that the Compose files no longer define is removed, not started again.
+    defined="$(docker_exec "${DOCKER_COMPOSE[@]}" config --services 2> /dev/null)"
+    services="$(jq -r --arg defined "$defined" "$DOCKER_JQ"'[.[] | select(service_container and .State.Running) |
+        compose("service") | select(IN($defined | split("\n")[]))] | unique[]' "$DOCKER_PROJECT")"
     docker_run "${DOCKER_COMPOSE[@]}" up --no-start --pull never --remove-orphans
     if [[ -n "$services" ]]; then
         mapfile -t running <<< "$services"
         docker_run "${DOCKER_COMPOSE[@]}" up --detach --wait --wait-timeout "$DOCKER_WAIT_SECONDS" \
             --pull never "${running[@]}"
     fi
+    docker_load_inventory
+    docker_record_container_changes "$project"
     docker_remove_leftovers "$project"
-    success "${project}: updated from its Compose files; ${#running[@]} service(s) running."
+    docker_report_result "$project" "${running[@]}"
+}
+
+# Adds "1 noun verb" or "N nouns verb" to DOCKER_CHANGES; a zero count adds nothing.
+docker_record_change() {
+    local count="$1" noun="$2" verb="$3"
+    if (( count == 1 )); then
+        DOCKER_CHANGES+=("1 ${noun} ${verb}")
+    elif (( count > 1 )); then
+        DOCKER_CHANGES+=("${count} ${noun}s ${verb}")
+    fi
+}
+
+# Compares the project's service containers before (DOCKER_PROJECT) and after the update.
+docker_record_container_changes() {
+    local project="$1" counts recreated created removed
+    counts="$(jq -r --arg project "$project" --slurpfile before "$DOCKER_PROJECT" "$DOCKER_JQ"'
+        [$before[0][] | select(service_container)] as $old |
+        [.[] | select(compose("project") == $project and service_container)] as $new |
+        [$new[] | select(.Id | IN($old[].Id) | not)] as $fresh |
+        ([$old[] | compose("service")] | unique) as $old_services |
+        ([$new[] | compose("service")] | unique) as $new_services |
+        [([$fresh[] | select(compose("service") | IN($old_services[]))] | length),
+         ([$fresh[] | select(compose("service") | IN($old_services[]) | not)] | length),
+         ([$old[] | select(compose("service") | IN($new_services[]) | not)] | length)] | @tsv' "$DOCKER_INVENTORY")"
+    read -r recreated created removed <<< "$counts"
+    docker_record_change "$recreated" container recreated
+    docker_record_change "$created" container created
+    docker_record_change "$removed" container removed
+}
+
+# One line per project: what changed, or that nothing did, and which services run now.
+docker_report_result() {
+    local project="$1" summary='already up to date, nothing changed' state='Stopped, as before'
+    shift
+    if (( ${#DOCKER_CHANGES[@]} > 0 )); then
+        printf -v summary '%s, ' "${DOCKER_CHANGES[@]}"
+        summary="${summary%, }"
+    fi
+    if (( $# > 0 )); then
+        printf -v state '%s, ' "$@"
+        state="Running: ${state%, }"
+    fi
+    success "${project}: ${summary}. ${state}."
 }
 
 # Removes only unused things the project owns. Named volumes and bind mounts hold application data and are kept.
 docker_remove_leftovers() {
     local project="$1"
-    docker_load_inventory
     docker_remove_oneoff_containers "$project"
     docker_load_inventory
     docker_remove_unused_networks "$project"
@@ -364,7 +413,9 @@ docker_remove_oneoff_containers() {
         (service_container | not) and (.State.Running | not)) | .Id' "$DOCKER_INVENTORY")"
     [[ -n "$ids" ]] || return 0
     mapfile -t containers <<< "$ids"
-    if ! docker_run rm --volumes "${containers[@]}"; then
+    if docker_run rm --volumes "${containers[@]}"; then
+        docker_record_change "${#containers[@]}" 'leftover container' removed
+    else
         warn_condition "${project}: could not remove its stopped one-off containers; they were kept."
     fi
 }
@@ -382,7 +433,9 @@ docker_remove_unused_networks() {
             select(. as $network | all($all[0][]; .NetworkSettings.Networks // {} | has($network) | not))')"
     [[ -n "$unused" ]] || return 0
     mapfile -t networks <<< "$unused"
-    if ! docker_run network rm "${networks[@]}"; then
+    if docker_run network rm "${networks[@]}"; then
+        docker_record_change "${#networks[@]}" 'unused network' removed
+    else
         warn_condition "${project}: could not remove networks it no longer defines; they were kept."
     fi
 }
@@ -390,7 +443,7 @@ docker_remove_unused_networks() {
 # Removes images that DOCKER_PROJECT's containers ran before the update once no container uses them,
 # provided every tag left on them is a reference the project itself used.
 docker_remove_replaced_images() {
-    local replaced id record tags
+    local replaced id record tags removed=0
     local -a ids=() targets=()
     replaced="$(jq -r --slurpfile now "$DOCKER_INVENTORY" '[.[].Image] - [$now[0][].Image] | unique[]' "$DOCKER_PROJECT")"
     [[ -n "$replaced" ]] || return 0
@@ -409,8 +462,11 @@ docker_remove_replaced_images() {
         else
             targets=("$id")
         fi
-        if ! docker_run image rm "${targets[@]}"; then
+        if docker_run image rm "${targets[@]}"; then
+            removed=$((removed + 1))
+        else
             warn_condition "Could not remove replaced image ${id}; it was kept."
         fi
     done
+    docker_record_change "$removed" 'old image' removed
 }
