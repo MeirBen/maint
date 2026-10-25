@@ -5,14 +5,21 @@
 ## Usage
 
 ```bash
-maint                 # Menu of every action; returns to the menu after each one
-maint MODULE          # Menu of one module's actions
-maint MODULE ACTION   # Run one action and exit
-maint help            # Show every command
-maint list            # Every action as tab-separated MODULE, ACTION, TITLE, DESCRIPTION
+maint                       # Menu of every action; returns after each one
+maint MODULE                # Menu of one module's actions
+maint MODULE ACTION         # Run one action and exit
+maint --help                 # General help (-h also works)
+maint docker --help          # Help for one module
+maint docker pull --help     # Help for one action
+maint help docker pull       # Equivalent command-specific help
+maint --version              # Program version (-V also works)
+maint --no-color docker list  # Run without maint's terminal colors
+maint list                   # Tab-separated MODULE, ACTION, TITLE, DESCRIPTION
 ```
 
-Press Tab to complete module and action names.
+Options can appear before or after the module and action. `--` ends option parsing; for example, `maint -- docker list`. Unknown options, extra arguments, and unknown commands report an error on stderr and exit with status `2`. `--version` is used without a command or `--help`; it does not load modules or initialize the action runtime. Help never runs an action.
+
+Press Tab to complete options, module names, action names, and `help` targets. Existing `maint help`, menu navigation, action commands, and the machine-readable `maint list` format remain supported.
 
 Menus wrap to the terminal width. Docker inventory uses aligned columns when they fit and labeled entries in narrower windows; logs and redirected Docker output keep the full tab-separated values. Set `NO_COLOR=1` for plain text.
 
@@ -35,12 +42,13 @@ Run them as your own user; they ask for sudo only to change `/usr/local/bin`. Op
 - **Module settings** sit in a `# Settings.` block at the top of each module.
 - **Shared settings** sit at the top of `lib/common.sh`: `LOG_RETENTION_DAYS` and `LOCK_WAIT_SECONDS`.
 - **Menu text** is the `MODULE_TITLE` and the `MODULE_ACTIONS` descriptions of each module.
+- **Release version** is defined once by `MAINT_VERSION` in `maint`; update it when preparing a release.
 
 Changes apply on the next run; nothing needs reinstalling.
 
 ## Writing a module
 
-Drop a file such as `modules/disk.sh` into `modules/`. Its name is the module name (`help` and `list` are taken by the built-in commands), and it only defines variables and functions:
+Drop a file such as `modules/disk.sh` into `modules/`. Its name is the module name (`help`, `list`, and the CLI option names are reserved), and it only defines variables and functions:
 
 ```bash
 # shellcheck shell=bash disable=SC2034 # MODULE_TITLE and MODULE_ACTIONS are read by maint.

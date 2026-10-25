@@ -4,6 +4,7 @@ set -Eeuo pipefail
 # maint: entry point of the modular maintenance framework. Discovers the modules in modules/,
 # then opens the menu or runs one action; see `maint help`.
 
+readonly MAINT_VERSION='0.1.0'
 MAINT_ROOT="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 # Actions run in this separate process; the menu and command line never load lib/common.sh.
 RUNNER="${MAINT_ROOT}/lib/run.sh"
@@ -24,7 +25,7 @@ load_modules() {
         id="${file##*/}"
         id="${id%.sh}"
         case "$id" in
-            help|-h|--help|list)
+            help|list|-h|--help|-V|--version|--no-color|--)
                 printf 'Skipping module %s: %s is a built-in command.\n' "${file##*/}" "$id" >&2
                 continue ;;
         esac
@@ -82,27 +83,75 @@ reject() {
         done
     fi
     choices="${choices%, }"
-    printf "%s Choose from: %s. Run 'maint help' for details.\n" "$message" "${choices:-none}" >&2
+    usage_error "$message Choose from: ${choices:-none}."
+}
+
+usage_error() {
+    printf "maint: %s\nTry 'maint --help' for usage.\n" "$1" >&2
     exit 2
 }
 
 usage() {
-    local index
-    cat <<'EOF'
-Usage: maint [MODULE [ACTION]]
+    local module="${1:-}" action="${2:-}" index
+    terminal_setup
+    printf 'maint %s - System and container maintenance\n\n' "$MAINT_VERSION"
+    if [[ -z "$module" ]]; then
+        cat <<'EOF'
+Usage: maint [OPTIONS] [MODULE [ACTION]]
+       maint help [MODULE [ACTION]]
+       maint list
 
-  maint                  Open the menu
-  maint MODULE           Open one module's menu
-  maint MODULE ACTION    Run one action
-  maint list             Print every action as tab-separated MODULE, ACTION, TITLE, DESCRIPTION
-  maint help             Show this help
+Run without arguments to open the menu, or with MODULE to open its menu.
+Provide MODULE ACTION to run one action and exit.
 
-Actions:
+Commands:
 EOF
-    for index in "${!ENTRY_MODULES[@]}"; do
-        printf '  %-22s %s\n' "maint ${ENTRY_MODULES[index]} ${ENTRY_ACTIONS[index]}" \
-            "${ENTRY_DESCRIPTIONS[index]}"
-    done
+        printf '  %-22s %s\n' \
+            'help [MODULE [ACTION]]' 'Show general or command-specific help' \
+            'list' 'List actions as tab-separated values'
+    elif [[ "$module" == list ]]; then
+        printf 'Usage: maint [OPTIONS] list\n\n'
+        printf 'Print tab-separated MODULE, ACTION, TITLE, DESCRIPTION for each action.\n'
+    elif [[ -z "$action" ]]; then
+        printf 'Usage: maint [OPTIONS] %s [ACTION]\n\n' "$module"
+        printf 'Open the %s menu, or run one of its actions directly.\n' "${MODULE_TITLES[$module]}"
+    else
+        printf 'Usage: maint [OPTIONS] %s %s\n' "$module" "$action"
+    fi
+
+    if [[ "$module" != list ]]; then
+        printf '\nActions:\n'
+        for index in "${!ENTRY_MODULES[@]}"; do
+            [[ -z "$module" || "${ENTRY_MODULES[index]}" == "$module" ]] || continue
+            [[ -z "$action" || "${ENTRY_ACTIONS[index]}" == "$action" ]] || continue
+            terminal_wrap '  ' "maint ${ENTRY_MODULES[index]} ${ENTRY_ACTIONS[index]}" "$TERMINAL_WIDTH"
+            terminal_wrap '    ' "${ENTRY_DESCRIPTIONS[index]}" "$TERMINAL_WIDTH"
+        done
+    fi
+    printf '\nOptions:\n'
+    printf '  %-22s %s\n' \
+        '-h, --help' 'Show help for the selected command and exit' \
+        '-V, --version' 'Show the program version and exit (used alone)' \
+        '    --no-color' "Disable maint's terminal colors" \
+        '    --' 'Stop parsing options'
+    cat <<'EOF'
+
+Options may appear before or after MODULE and ACTION, up to --.
+
+Exit status:
+  0  Success or cancellation
+  2  Invalid command or arguments
+  Other failures preserve the action's exit status; Ctrl+C returns 130.
+EOF
+    if [[ -z "$module" ]]; then
+        cat <<'EOF'
+
+Examples:
+  maint docker --help
+  maint docker list
+  maint --no-color sys update
+EOF
+    fi
 }
 
 # Machine-readable registry for completion and other front ends; keep the columns stable.
@@ -176,21 +225,53 @@ run_menu() {
 }
 
 main() {
+    local show_help=0 show_version=0 argument
+    local -a arguments=()
+    while (( $# > 0 )); do
+        case "$1" in
+            -h|--help) show_help=1 ;;
+            -V|--version) show_version=1 ;;
+            --no-color) export NO_COLOR=1 ;;
+            --) shift; arguments+=("$@"); break ;;
+            -*) usage_error "Unknown option '$1'." ;;
+            *) arguments+=("$1") ;;
+        esac
+        shift
+    done
+    set -- "${arguments[@]}"
+    if (( show_version )); then
+        (( show_help == 0 && $# == 0 )) || usage_error '--version must be used without a command or --help.'
+        printf 'maint %s\n' "$MAINT_VERSION"
+        return 0
+    fi
+    if [[ "${1:-}" == help ]]; then
+        show_help=1
+        shift
+    fi
+    (( $# <= 2 )) || usage_error "Unexpected argument '$3'."
+    for argument in "$@"; do
+        [[ -n "$argument" ]] || usage_error 'Module and action names must not be empty.'
+    done
+
     load_modules
     case "$#:${1:-}" in
-        0:) run_menu ;;
-        1:help|1:-h|1:--help) usage ;;
-        1:list) list_actions ;;
-        1:*)
-            [[ -n "${MODULE_TITLES[$1]+set}" ]] || reject "Unknown module '$1'."
-            run_menu "$1" ;;
-        2:*)
-            [[ -n "${MODULE_TITLES[$1]+set}" ]] || reject "Unknown module '$1'."
-            is_registered "$1" "$2" || reject "Unknown action '$2' for $1." "$1"
-            exec "$BASH" "$RUNNER" "$1" "$2" ;;
+        0:)
+            if (( show_help )); then usage; else run_menu; fi ;;
+        1:list)
+            if (( show_help )); then usage list; else list_actions; fi ;;
+        2:list) usage_error "The 'list' command does not accept arguments." ;;
         *)
-            usage >&2
-            return 2 ;;
+            [[ -n "${MODULE_TITLES[$1]+set}" ]] || reject "Unknown module '$1'."
+            if (( $# == 2 )); then
+                is_registered "$1" "$2" || reject "Unknown action '$2' for $1." "$1"
+            fi
+            if (( show_help )); then
+                usage "$@"
+            elif (( $# == 1 )); then
+                run_menu "$1"
+            else
+                exec "$BASH" "$RUNNER" "$1" "$2"
+            fi ;;
     esac
 }
 

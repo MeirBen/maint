@@ -328,6 +328,89 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(expected, result.stderr)
 
+    def test_version_does_not_load_modules_or_initialize_runtime(self):
+        (self.maint_root / "modules/noisy.sh").write_text('echo loaded > "$TRACE"\nreturn 1\n')
+        outputs = []
+        for arguments in (("--version",), ("-V",), ("--no-color", "--version")):
+            result = self.maint(*arguments)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertRegex(result.stdout, r"^maint \d+\.\d+\.\d+\n$")
+            self.assertEqual(result.stderr, "")
+            outputs.append(result.stdout)
+        self.assertEqual(len(set(outputs)), 1)
+        self.assertFalse(self.trace.exists())
+        self.assertFalse((self.maint_root / "logs").exists())
+
+    def test_scoped_help_uses_registry_without_running_actions(self):
+        self.add_probe_module()
+        for arguments in (("help", "probe"), ("probe", "--help"), ("probe", "-h"),
+                ("help", "probe", "work"), ("probe", "work", "--help"),
+                ("--help", "probe", "work"), ("probe", "--help", "work")):
+            with self.subTest(arguments=arguments):
+                result = self.maint(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Usage:", result.stdout)
+                self.assertIn("Do probe work", result.stdout)
+                self.assertNotIn("maint sys update", result.stdout)
+                if "work" in arguments:
+                    self.assertNotIn("Wait for a signal", result.stdout)
+                self.assertEqual(result.stderr, "")
+        for arguments in (("list", "--help"), ("help", "list")):
+            result = self.maint(*arguments)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("tab-separated", result.stdout)
+            self.assertNotIn("sys\tupdate\t", result.stdout)
+        self.assertFalse(self.trace.exists())
+        self.assertFalse((self.maint_root / "logs").exists())
+
+    def test_invalid_options_and_operands_fail_before_running_actions(self):
+        self.add_probe_module()
+        for arguments in (("--unknown",), ("probe", "work", "--unknown"),
+                ("probe", "work", "--help", "--unknown"), ("--version", "probe"),
+                ("--version", "--help"), ("probe", "work", "extra"),
+                ("list", "extra"), ("",), ("probe", ""), ("help", "missing")):
+            with self.subTest(arguments=arguments):
+                result = self.maint(*arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("maint:", result.stderr)
+                self.assertIn("--help", result.stderr)
+        self.assertFalse(self.trace.exists())
+        self.assertFalse((self.maint_root / "logs").exists())
+
+    def test_help_preserves_command_names_when_descriptions_need_separate_lines(self):
+        for module, columns in (("probe", "20"), ("extended_" + "module_" * 9, "80")):
+            with self.subTest(module=module, columns=columns):
+                (self.maint_root / "modules" / (module + ".sh")).write_text(PROBE_MODULE)
+                result = self.maint(module, "--help", COLUMNS=columns)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                text = " ".join(result.stdout.split())
+                self.assertIn("maint " + module + " work", text)
+                self.assertIn("maint " + module + " wait", text)
+
+    def test_no_color_option_reaches_action_runtime_in_any_position(self):
+        self.add_probe_module()
+        self.env.pop("NO_COLOR", None)
+        self.env["TERM"] = "xterm-256color"
+        for arguments in (("--no-color", "probe", "work"),
+                ("probe", "--no-color", "work"), ("probe", "work", "--no-color")):
+            with self.subTest(arguments=arguments):
+                status, output = self.terminal_run(self.entry_point, *arguments)
+                self.assertEqual(status, 0, output)
+                self.assertIn("probe-work", output)
+                self.assertNotIn("\x1b", output)
+
+    def test_option_separator_keeps_following_action_name_literal(self):
+        (self.maint_root / "modules/probe.sh").write_text('''
+MODULE_TITLE='Probe'
+MODULE_ACTIONS=('--help|Run the literal action')
+action_--help() { info literal-action; }
+''')
+        for arguments in (("--", "probe", "--help"), ("probe", "--", "--help")):
+            result = self.maint(*arguments)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("literal-action", result.stdout)
+
     def test_tab_completion_offers_modules_then_their_actions(self):
         self.entry_point.chmod(0o750)
         (self.bin / "maint").symlink_to(self.entry_point)
@@ -335,7 +418,17 @@ run_root /bin/printf '<%s>\\n' 'two words' '*literal*'
             '\nCOMP_WORDS=("$@"); COMP_CWORD=$(($# - 1)); _maint; printf "%s\\n" "${COMPREPLY[@]}"')
         for words, expected in ((["maint", ""], ["help", "list", "docker", "sys"]),
                 (["maint", "s"], ["sys"]), (["maint", "sys", "u"], ["update"]),
-                (["maint", "sys", "update", ""], [""])):
+                (["maint", "sys", "update", ""], [""]),
+                (["maint", "--"], ["--help", "--no-color", "--", "--version"]),
+                (["maint", "--no-color", ""], ["help", "list", "docker", "sys"]),
+                (["maint", "--no-color", "sys", "u"], ["update"]),
+                (["maint", "help", "docker", ""], ["list", "pull", "update"]),
+                (["maint", "docker", "--"], ["--help", "--no-color", "--"]),
+                (["maint", "docker", "--no-color", ""], ["list", "pull", "update"]),
+                (["maint", "--version", ""], [""]),
+                (["maint", "--help", "--"], ["--help", "--no-color", "--"]),
+                (["maint", "help", ""], ["list", "docker", "sys"]),
+                (["maint", "--", "sys", "u"], ["update"])):
             with self.subTest(words=words):
                 result = subprocess.run(["/bin/bash", "-c", script, "completion", *words],
                     capture_output=True, text=True, timeout=6, env=self.env)
