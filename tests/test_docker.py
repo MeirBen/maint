@@ -10,8 +10,15 @@ FAKE_DOCKER = r'''#!/usr/bin/python3
 import json, os, sys
 from pathlib import Path
 
+def stored(ref):
+    # The engine records a name:tag@digest reference as name@digest.
+    name, at, digest = ref.partition('@')
+    head, slash, last = name.rpartition('/')
+    return head + slash + last.split(':')[0] + at + digest if at else ref
+
 path = Path(os.environ['DOCKER_FIXTURE'])
 data = json.loads(path.read_text())
+data['images'] = {stored(ref): image for ref, image in data['images'].items()}
 args = sys.argv[1:]
 with open(os.environ['DOCKER_TRACE'], 'a') as trace:
     trace.write(json.dumps(args) + '\n')
@@ -29,10 +36,6 @@ def tags(image_id):
     return sorted(ref for ref, tagged in data['images'].items() if tagged == image_id)
 def in_use(image_id):
     return any(container['Image'] == image_id for container in data['containers'])
-def oneoff(container):
-    return container['Config']['Labels'].get('com.docker.compose.oneoff') == 'True'
-def attached(network):
-    return any(network in container['NetworkSettings']['Networks'] for container in data['containers'])
 if args == ['context', 'show']:
     print('test-context')
 elif args[:2] == ['context', 'inspect']:
@@ -64,25 +67,12 @@ elif args[:2] == ['image', 'rm']:
             data['store'].remove(image_id)
     save()
     print('Deleted')
-elif args[0] == 'rm':
-    if any(c['Id'] in args[1:] and c['State']['Running'] for c in data['containers']):
-        fail('cannot remove a running container')
-    data['containers'] = [c for c in data['containers'] if c['Id'] not in args[1:]]
-    save()
-elif args[:2] == ['network', 'ls']:
-    project = args[args.index('--filter') + 1].split('=')[-1]
-    print('\n'.join(n['name'] for n in data['networks'] if n['project'] == project))
-elif args[:2] == ['network', 'rm']:
-    if any(attached(name) for name in args[2:]):
-        fail('network has active endpoints')
-    data['networks'] = [n for n in data['networks'] if n['name'] not in args[2:]]
-    save()
 elif args[:2] == ['compose', 'version']:
     print('Docker Compose version test')
 elif args[0] == 'compose':
     args = args[1:]
     context = {}
-    while args[0] in ('--project-name', '--project-directory', '--file', '--env-file'):
+    while args[0] in ('--project-name', '--project-directory', '--file'):
         context.setdefault(args[0], []).append(args[1])
         args = args[2:]
     if '--project-name' not in context or '--project-directory' not in context or '--file' not in context:
@@ -90,16 +80,12 @@ elif args[0] == 'compose':
     project = context['--project-name'][0]
     services = data['projects'][project]
     command = args[0]
-    members = [c for c in data['containers'] if owner(c)[0] == project and not oneoff(c)]
+    members = [c for c in data['containers'] if owner(c)[0] == project]
     if command == 'config' and '--services' in args:
         print('\n'.join(services))
     elif command == 'config' and '--hash' in args:
         for service in services:
             print(service, data['hashes'].get(project + '/' + service, 'same-hash'))
-    elif command == 'config' and '--format' in args:
-        print(json.dumps({'services': {service: {'image': ref} for service, ref in services.items()},
-            'networks': {'default': {'name': project + '_default'}} |
-                {n['name']: {'name': n['name']} for n in data['networks'] if n['project'] == project and n.get('defined')}}))
     elif command == 'config':
         if data.get('config_error') == project:
             fail('services.api.image: invalid reference')
@@ -107,9 +93,10 @@ elif args[0] == 'compose':
         for ref in sorted(set(services.values())):
             if ref == data.get('pull_failure'):
                 fail('registry unavailable', 42)
-            data['images'][ref] = data['registry'].get(ref, data['images'].get(ref))
-            if data['images'][ref] not in data['store']:
-                data['store'].append(data['images'][ref])
+            key = stored(ref)
+            data['images'][key] = data['registry'].get(ref, data['images'].get(key))
+            if data['images'][key] not in data['store']:
+                data['store'].append(data['images'][key])
         if data.get('change_during_pull') == 'stop':
             for container in members:
                 container['State'] = {'Status': 'exited', 'Running': False}
@@ -121,9 +108,10 @@ elif args[0] == 'compose':
             name, service = owner(container)
             if service in services:
                 ref = services[service]
-                if container['Image'] != data['images'][ref] or container['Config']['Image'] != ref:
+                image = data['images'][stored(ref)]
+                if container['Image'] != image or container['Config']['Image'] != ref:
                     container['Id'] += '-recreated'
-                    container['Image'] = data['images'][ref]
+                    container['Image'] = image
                     container['Config']['Image'] = ref
                     container['State'] = {'Status': 'created', 'Running': False}
         save()
@@ -166,8 +154,7 @@ class DockerTests(unittest.TestCase):
             self.env.pop(key, None)
         self.command('docker', FAKE_DOCKER)
         self.command('sudo', '#!/bin/bash\nif [[ "$1" == -v ]]; then exit 0; fi\nexport FAKE_ROOT=1\nexec "$@"\n')
-        self.data = {'containers': [], 'images': {}, 'store': [], 'registry': {}, 'projects': {},
-            'hashes': {}, 'networks': []}
+        self.data = {'containers': [], 'images': {}, 'store': [], 'registry': {}, 'projects': {}, 'hashes': {}}
 
     def compose_file(self, project):
         directory = self.root / 'projects with spaces' / project
@@ -186,15 +173,13 @@ class DockerTests(unittest.TestCase):
                 'com.docker.compose.service': service,
                 'com.docker.compose.project.config_files': str(compose),
                 'com.docker.compose.project.working_dir': str(compose.parent),
-                'com.docker.compose.oneoff': 'False',
                 'com.docker.compose.config-hash': 'same-hash',
             }
             self.data['projects'].setdefault(project, {})[service] = image
         old, new = 'sha256:old-' + image, 'sha256:new-' + image
         container = {'Id': name + '-id', 'Name': '/' + name, 'Image': old,
             'Config': {'Image': image, 'Labels': labels},
-            'State': {'Status': 'running' if running else 'exited', 'Running': running},
-            'NetworkSettings': {'Networks': {project + '_default' if managed else 'bridge': {}}}}
+            'State': {'Status': 'running' if running else 'exited', 'Running': running}}
         self.data['containers'].append(container)
         self.data['images'][image] = old
         self.data['registry'][image] = new
@@ -252,31 +237,22 @@ class DockerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('No containers', result.stdout)
 
-    def test_update_applies_recorded_compose_context_and_keeps_stopped_services_stopped(self):
+    def test_update_applies_recorded_compose_file_and_keeps_stopped_services_stopped(self):
         self.setup_docker()
         api = self.add_container('api')
         self.add_container('jobs', service='jobs', running=False, image='example/jobs:1')
         self.add_container('idle', project='idle', running=False, image='example/idle:1')
-        override = self.root / 'override settings.yaml'
-        override.write_text('services: {}\n')
-        env_file = self.root / 'settings.env'
-        env_file.write_text('SECRET=test\n')
-        for container in self.data['containers'][:2]:
-            labels = container['Config']['Labels']
-            labels['com.docker.compose.project.config_files'] += ',' + str(override)
-            labels['com.docker.compose.project.environment_file'] = str(env_file)
         status, output = self.update()
         self.assertEqual(status, 0, output)
+        labels = api['Config']['Labels']
         converge = self.operations('up', '--no-start', 'sample')[0]
-        files = [converge[i + 1] for i, word in enumerate(converge) if word == '--file']
-        self.assertEqual(files, [api['Config']['Labels']['com.docker.compose.project.config_files'].split(',')[0],
-            str(override)])
-        self.assertIn(str(env_file), converge)
+        self.assertEqual(converge[converge.index('--file') + 1], labels['com.docker.compose.project.config_files'])
+        self.assertEqual(converge[converge.index('--project-directory') + 1],
+            labels['com.docker.compose.project.working_dir'])
         started = self.operations('up', '--detach')
         self.assertEqual(len(started), 1, output)
         self.assertIn('api', started[0])
         self.assertNotIn('jobs', started[0])
-        self.assertNotIn('SECRET=test', output)
         self.assertIn('sample: 2 containers recreated, 2 old images removed. Running: api.', output)
         self.assertIn('idle: 1 container recreated, 1 old image removed. Stopped, as before.', output)
         states = {c['Name']: (c['State']['Running'], c['Image']) for c in self.saved()['containers']}
@@ -337,6 +313,18 @@ class DockerTests(unittest.TestCase):
                     self.assertIn('backup/app:keep', output)
                     self.assertEqual(saved['images']['backup/app:keep'], old)
 
+    def test_image_replaced_by_a_bumped_digest_pin_is_removed(self):
+        self.setup_docker()
+        pinned = 'registry.example/database/free:1.0@sha256:' + 'a' * 64
+        bumped = 'registry.example/database/free:1.1@sha256:' + 'b' * 64
+        self.add_container('db', service='db', image=pinned)
+        self.data['projects']['sample']['db'] = bumped
+        self.data['registry'][bumped] = 'sha256:bumped'
+        status, output = self.update()
+        self.assertEqual(status, 0, output)
+        self.assertIn('sample: 1 container recreated, 1 old image removed. Running: db.', output)
+        self.assertEqual(self.saved()['store'], ['sha256:bumped'])
+
     def test_containers_of_services_removed_from_compose_are_deleted_within_the_project_only(self):
         self.setup_docker()
         self.add_container('api')
@@ -365,31 +353,6 @@ class DockerTests(unittest.TestCase):
         self.assertNotIn('worker', notes.split('[NOTE]', 1)[1])
         self.assertFalse(self.mutations())
 
-    def test_cleanup_removes_unused_project_leftovers_and_keeps_what_is_in_use(self):
-        self.setup_docker()
-        self.add_container('api', running=False)
-        for name, running in (('run-done', False), ('run-live', True)):
-            container = self.add_container(name, running=running)
-            container['Config']['Labels']['com.docker.compose.oneoff'] = 'True'
-        self.data['containers'][-1]['NetworkSettings']['Networks']['sample_attached'] = {}
-        self.data['networks'] = [{'name': name, 'project': project} for name, project in (
-            ('sample_default', 'sample'), ('sample_legacy', 'sample'), ('sample_attached', 'sample'),
-            ('neighbor_legacy', 'neighbor'))] + [{'name': 'sample_spare', 'project': 'sample', 'defined': True}]
-        status, output = self.update()
-        self.assertEqual(status, 0, output)
-        self.assertIn('no warning conditions', output)
-        self.assertIn('sample: 1 container recreated, 1 leftover container removed, 1 unused network removed. '
-            'Stopped, as before.', output)
-        saved = self.saved()
-        self.assertEqual({c['Name']: c['State']['Running'] for c in saved['containers']},
-            {'/api': False, '/run-live': True})
-        self.assertEqual({n['name'] for n in saved['networks']},
-            {'sample_default', 'sample_attached', 'sample_spare', 'neighbor_legacy'})
-        self.assertIn('sha256:old-example/app:latest', saved['store'])
-        removed = [call for call in self.operations('rm') if 'image' not in call and 'network' not in call]
-        self.assertEqual(len(removed), 1)
-        self.assertIn('--volumes', removed[0])
-
     def test_selection_limits_every_change_to_the_chosen_projects(self):
         self.setup_docker()
         self.add_container('one', project='alpha')
@@ -417,26 +380,34 @@ class DockerTests(unittest.TestCase):
                 self.assertFalse(self.mutations())
 
     def test_projects_that_cannot_be_reproduced_are_skipped_without_changes(self):
-        for mode in ('missing-file', 'missing-env', 'mixed-sources', 'unresolved'):
+        reasons = {'missing-file': 'file is unavailable', 'several-files': 'only single-file projects',
+            'env-file': 'only single-file projects', 'mixed-sources': 'different Compose files',
+            'unresolved': 'does not resolve'}
+        for mode, reason in reasons.items():
             with self.subTest(mode=mode):
                 self.setup_docker()
                 api = self.add_container('api')
                 worker = self.add_container('worker', service='worker')
                 labels = api['Config']['Labels']
+                compose = labels['com.docker.compose.project.config_files']
                 if mode == 'missing-file':
                     for container in (api, worker):
                         container['Config']['Labels']['com.docker.compose.project.config_files'] = '/missing/compose.yaml'
-                if mode == 'missing-env':
+                if mode == 'several-files':
                     for container in (api, worker):
-                        container['Config']['Labels']['com.docker.compose.project.environment_file'] = 'absent.env'
+                        container['Config']['Labels']['com.docker.compose.project.config_files'] = compose + ',' + compose
+                if mode == 'env-file':
+                    for container in (api, worker):
+                        container['Config']['Labels']['com.docker.compose.project.environment_file'] = compose
                 if mode == 'mixed-sources':
-                    labels['com.docker.compose.project.config_files'] += ',' + labels['com.docker.compose.project.config_files']
+                    labels['com.docker.compose.project.config_files'] = str(self.compose_file('other'))
                 if mode == 'unresolved':
                     self.data['config_error'] = 'sample'
                 self.save()
                 result = self.maint('docker', 'update')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('Skipping sample', result.stdout)
+                self.assertIn(reason, result.stdout)
                 self.assertFalse(self.mutations())
 
     def test_containers_outside_compose_are_never_updated(self):

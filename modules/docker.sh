@@ -1,11 +1,12 @@
 # shellcheck shell=bash disable=SC2034 # MODULE_TITLE and MODULE_ACTIONS are read by maint.
-# Docker: list local containers; update Compose projects from their current Compose files.
-# The unit of update is a Compose project: everything an update recreates or removes belongs to it.
+# Docker: list local containers; update Compose projects from their current Compose file.
+# The unit of update is a Compose project deployed from one Compose file: everything an update recreates
+# or removes belongs to it.
 
 MODULE_TITLE='Docker'
 MODULE_ACTIONS=(
     'list|List containers by Compose project; changes nothing'
-    'update|Pull newer images, apply the current Compose files, and remove what they leave behind'
+    'update|Pull newer images, apply the current Compose file, and remove the images it replaced'
 )
 
 # Settings.
@@ -16,9 +17,8 @@ DOCKER_JQ='
 def compose($name): .Config.Labels["com.docker.compose." + $name] // "";
 def name: .Name | ltrimstr("/");
 def state: .State.Status + (if .State.Health then " (" + .State.Health.Status + ")" else "" end);
-def service_container: (compose("oneoff") | ascii_downcase) != "true";
 def projects: [.[] | compose("project") | select(. != "")] | unique;
-def familiar: sub("^(index\\.)?docker\\.io/"; "") | sub("^library/"; "") |
+def familiar: sub("^(index\\.)?docker\\.io/"; "") | sub("^library/"; "") | sub(":[^/@]*@"; "@") |
     if split("/")[-1] | test("[:@]") then . else . + ":latest" end;
 '
 
@@ -57,11 +57,11 @@ action_update() {
         info 'No selected project can be updated.'
         return 0
     fi
-    warn_note 'Settings such as ports, users, and environment are applied exactly as written in the Compose and environment files; changes made to containers by hand are not kept.'
+    warn_note 'Settings such as ports, users, and limits are applied exactly as written in the Compose file; changes made to containers by hand are not kept.'
     warn_note 'Services whose image or settings changed are recreated; containers of services no longer defined are removed.'
     warn_note "Services that were running are started again and must be running/healthy within ${DOCKER_WAIT_SECONDS} seconds; stopped services stay stopped unless a running service depends on them."
     warn_note 'Named volumes and bind mounts are kept. Recreation loses in-memory data, tmpfs contents, and files changed inside the container.'
-    warn_note 'Afterwards the leftovers each project owns are removed: replaced images, stopped one-off containers with their anonymous volumes, and networks it no longer defines. Named volumes are never removed.'
+    warn_note 'Afterwards the images each project ran before are removed once no container uses them.'
     if ! confirm "Update ${#ready[@]} Compose project(s)?"; then
         info 'Update cancelled; nothing was changed.'
         return 0
@@ -73,7 +73,7 @@ action_update() {
             error "Stopping before any change: ${project} can no longer be reproduced."
             return 1
         fi
-        docker_run "${DOCKER_COMPOSE[@]}" pull --ignore-buildable
+        docker_run "${DOCKER_COMPOSE[@]}" pull
     done
     for project in "${ready[@]}"; do
         docker_update_project "$project"
@@ -244,11 +244,10 @@ docker_select_projects() {
     done
 }
 
-# Sets DOCKER_COMPOSE to the command that deployed the project: its name, directory, Compose files,
-# and environment files as recorded on its containers. Snapshots those containers to DOCKER_PROJECT.
+# Sets DOCKER_COMPOSE to the command that deployed the project: its name, directory, and Compose file
+# as recorded on its containers. Snapshots those containers to DOCKER_PROJECT.
 docker_compose_context() {
-    local project="$1" directory files environment_files path
-    local -a paths=()
+    local project="$1" directory file environment_files
     jq --arg project "$project" "$DOCKER_JQ"'map(select(compose("project") == $project))' \
         "$DOCKER_INVENTORY" > "$DOCKER_PROJECT"
     if ! jq -e "$DOCKER_JQ"'length > 0 and
@@ -258,48 +257,33 @@ docker_compose_context() {
         return 1
     fi
     directory="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.working_dir")' "$DOCKER_PROJECT")"
-    files="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.config_files")' "$DOCKER_PROJECT")"
+    file="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.config_files")' "$DOCKER_PROJECT")"
     environment_files="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.environment_file")' "$DOCKER_PROJECT")"
-    if [[ "$directory" != /* || ! -d "$directory" || -z "$files" || "$directory$files$environment_files" == *$'\n'* ]]; then
-        warn_condition "Skipping ${project}: its recorded Compose directory or file list is unavailable: ${directory}"
+    if [[ "$file" == *,* || -n "$environment_files" ]]; then
+        warn_condition "Skipping ${project}: it was deployed with several Compose files or an environment file; only single-file projects are updated."
         return 1
     fi
-    DOCKER_COMPOSE=(compose --project-name "$project" --project-directory "$directory")
-    IFS=, read -r -a paths <<< "$files"
-    for path in "${paths[@]}"; do
-        if [[ "$path" != /* || ! -r "$path" ]]; then
-            warn_condition "Skipping ${project}: Compose file is unavailable: ${path}"
-            return 1
-        fi
-        DOCKER_COMPOSE+=(--file "$path")
-    done
-    if [[ -n "$environment_files" ]]; then
-        IFS=, read -r -a paths <<< "$environment_files"
-        for path in "${paths[@]}"; do
-            [[ "$path" == /* ]] || path="$directory/$path"
-            if [[ ! -r "$path" ]]; then
-                warn_condition "Skipping ${project}: environment file is unavailable: ${path}"
-                return 1
-            fi
-            DOCKER_COMPOSE+=(--env-file "$path")
-        done
+    if [[ "$directory" != /* || ! -d "$directory" || "$file" != /* || ! -r "$file" || "$directory$file" == *$'\n'* ]]; then
+        warn_condition "Skipping ${project}: its recorded Compose directory or file is unavailable: ${directory}, ${file}"
+        return 1
     fi
+    DOCKER_COMPOSE=(compose --project-name "$project" --project-directory "$directory" --file "$file")
 }
 
-# Confirms the project's Compose files still resolve, and shows any Compose warnings before the prompt.
+# Confirms the project's Compose file still resolves, and shows any Compose warnings before the prompt.
 docker_check_project() {
     local project="$1" messages="$TMP_DIR/compose-check"
     docker_compose_context "$project" || return 1
     if ! docker_exec "${DOCKER_COMPOSE[@]}" config --quiet > "$messages" 2>&1; then
         tee -a "$LOG_FILE" < "$messages"
-        warn_condition "Skipping ${project}: its Compose files do not resolve; see the messages above."
+        warn_condition "Skipping ${project}: its Compose file does not resolve; see the messages above."
         return 1
     fi
     if [[ -s "$messages" ]]; then
         tee -a "$LOG_FILE" < "$messages"
         warn_condition "${project}: Compose reported the warnings above; review them before confirming."
     fi
-    info "Ready: ${project} ($(jq -r "$DOCKER_JQ"'.[0] | compose("project.config_files") | gsub(","; ", ")' "$DOCKER_PROJECT"))"
+    info "Ready: ${project} ($(jq -r "$DOCKER_JQ"'.[0] | compose("project.config_files")' "$DOCKER_PROJECT"))"
     docker_show_changes "$project"
 }
 
@@ -311,13 +295,13 @@ docker_show_changes() {
     hashes="$(docker_exec "${DOCKER_COMPOSE[@]}" config --hash '*' 2> /dev/null)"
     notes="$(jq -nr --arg hashes "$hashes" --slurpfile project "$DOCKER_PROJECT" "$DOCKER_JQ"'
         ($hashes | split("\n") | map(select(. != "") | split(" ") | {key: .[0], value: .[1]}) | from_entries) as $model |
-        [$project[0][] | select(service_container)] as $deployed |
+        $project[0] as $deployed |
         ([$deployed[] | compose("service") as $service |
             select($model[$service] != null and $model[$service] != compose("config-hash")) | $service] | unique) as $changed |
         ([$deployed[] | compose("service") | select($model[.] == null)] | unique) as $removed |
-        (select($changed != []) | "settings in the Compose files differ from the current containers for: " +
-            ($changed | join(", ")) + ". Expected after editing those files or upgrading Compose; otherwise decline and check for unset variables."),
-        (select($removed != []) | "no longer defined in the Compose files; their containers will be removed: " +
+        (select($changed != []) | "settings in the Compose file differ from the current containers for: " +
+            ($changed | join(", ")) + ". Expected after editing the file or upgrading Compose; otherwise decline and check for unset variables."),
+        (select($removed != []) | "no longer defined in the Compose file; their containers will be removed: " +
             ($removed | join(", ")))')"
     [[ -n "$notes" ]] || return 0
     mapfile -t lines <<< "$notes"
@@ -327,18 +311,18 @@ docker_show_changes() {
 }
 
 # Converges every service without starting anything new, restarts what was running before,
-# then removes what the update left unused.
+# then removes the images the update replaced.
 docker_update_project() {
     local project="$1" defined services
     local -a running=()
     DOCKER_CHANGES=()
-    info "${project}: applying its Compose files..."
+    info "${project}: applying its Compose file..."
     # Read the state after the downloads, not at selection time: it may have changed meanwhile.
     docker_load_inventory
     docker_compose_context "$project" || return 0
-    # A running service that the Compose files no longer define is removed, not started again.
+    # A running service that the Compose file no longer defines is removed, not started again.
     defined="$(docker_exec "${DOCKER_COMPOSE[@]}" config --services 2> /dev/null)"
-    services="$(jq -r --arg defined "$defined" "$DOCKER_JQ"'[.[] | select(service_container and .State.Running) |
+    services="$(jq -r --arg defined "$defined" "$DOCKER_JQ"'[.[] | select(.State.Running) |
         compose("service") | select(IN($defined | split("\n")[]))] | unique[]' "$DOCKER_PROJECT")"
     docker_run "${DOCKER_COMPOSE[@]}" up --no-start --pull never --remove-orphans
     if [[ -n "$services" ]]; then
@@ -348,7 +332,7 @@ docker_update_project() {
     fi
     docker_load_inventory
     docker_record_container_changes "$project"
-    docker_remove_leftovers "$project"
+    docker_remove_replaced_images
     docker_report_result "$project" "${running[@]}"
 }
 
@@ -362,12 +346,12 @@ docker_record_change() {
     fi
 }
 
-# Compares the project's service containers before (DOCKER_PROJECT) and after the update.
+# Compares the project's containers before (DOCKER_PROJECT) and after the update.
 docker_record_container_changes() {
     local project="$1" counts recreated created removed
     counts="$(jq -r --arg project "$project" --slurpfile before "$DOCKER_PROJECT" "$DOCKER_JQ"'
-        [$before[0][] | select(service_container)] as $old |
-        [.[] | select(compose("project") == $project and service_container)] as $new |
+        $before[0] as $old |
+        [.[] | select(compose("project") == $project)] as $new |
         [$new[] | select(.Id | IN($old[].Id) | not)] as $fresh |
         ([$old[] | compose("service")] | unique) as $old_services |
         ([$new[] | compose("service")] | unique) as $new_services |
@@ -393,51 +377,6 @@ docker_report_result() {
         state="Running: ${state%, }"
     fi
     success "${project}: ${summary}. ${state}."
-}
-
-# Removes only unused things the project owns. Named volumes and bind mounts hold application data and are kept.
-docker_remove_leftovers() {
-    local project="$1"
-    docker_remove_oneoff_containers "$project"
-    docker_load_inventory
-    docker_remove_unused_networks "$project"
-    docker_remove_replaced_images
-}
-
-# Removes stopped containers left by `docker compose run` with their anonymous volumes, as `run --rm` would.
-# Running ones are still in use.
-docker_remove_oneoff_containers() {
-    local project="$1" ids
-    local -a containers=()
-    ids="$(jq -r --arg project "$project" "$DOCKER_JQ"'.[] | select(compose("project") == $project and
-        (service_container | not) and (.State.Running | not)) | .Id' "$DOCKER_INVENTORY")"
-    [[ -n "$ids" ]] || return 0
-    mapfile -t containers <<< "$ids"
-    if docker_run rm --volumes "${containers[@]}"; then
-        docker_record_change "${#containers[@]}" 'leftover container' removed
-    else
-        warn_condition "${project}: could not remove its stopped one-off containers; they were kept."
-    fi
-}
-
-# Removes the project's networks that its Compose files no longer define and no container references.
-docker_remove_unused_networks() {
-    local project="$1" listed unused
-    local -a networks=()
-    listed="$(docker_exec network ls --filter "label=com.docker.compose.project=${project}" --format '{{.Name}}')"
-    [[ -n "$listed" ]] || return 0
-    unused="$(docker_exec "${DOCKER_COMPOSE[@]}" config --format json 2> /dev/null |
-        jq -r --arg listed "$listed" --slurpfile all "$DOCKER_INVENTORY" '
-            [.networks // {} | .[].name] as $defined |
-            $listed | split("\n")[] | select(IN($defined[]) | not) |
-            select(. as $network | all($all[0][]; .NetworkSettings.Networks // {} | has($network) | not))')"
-    [[ -n "$unused" ]] || return 0
-    mapfile -t networks <<< "$unused"
-    if docker_run network rm "${networks[@]}"; then
-        docker_record_change "${#networks[@]}" 'unused network' removed
-    else
-        warn_condition "${project}: could not remove networks it no longer defines; they were kept."
-    fi
 }
 
 # Removes images that DOCKER_PROJECT's containers ran before the update once no container uses them,
