@@ -36,10 +36,8 @@ def tags(image_id):
     return sorted(ref for ref, tagged in data['images'].items() if tagged == image_id)
 def in_use(image_id):
     return any(container['Image'] == image_id for container in data['containers'])
-if args == ['context', 'show']:
-    print('test-context')
-elif args[:2] == ['context', 'inspect']:
-    print(json.dumps([{'Endpoints': {'docker': {'Host': data.get('host', 'unix:///test/docker.sock')}}}]))
+if args == ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']:
+    print(data.get('host', 'unix:///test/docker.sock'))
 elif args == ['info']:
     if data.get('denied') and not os.environ.get('FAKE_ROOT'):
         fail('permission denied')
@@ -105,7 +103,7 @@ elif args[0] == 'compose':
         if '--remove-orphans' in args:
             data['containers'] = [c for c in data['containers'] if c not in members or owner(c)[1] in services]
         for container in members:
-            name, service = owner(container)
+            service = owner(container)[1]
             if service in services:
                 ref = services[service]
                 image = data['images'][stored(ref)]
@@ -150,8 +148,6 @@ class DockerTests(unittest.TestCase):
         self.docker_trace = self.root / 'docker-trace'
         self.docker_trace.unlink(missing_ok=True)
         self.env.update(DOCKER_FIXTURE=str(self.fixture), DOCKER_TRACE=str(self.docker_trace))
-        for key in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'COMPOSE_FILE', 'COMPOSE_PROJECT_NAME'):
-            self.env.pop(key, None)
         self.command('docker', FAKE_DOCKER)
         self.command('sudo', '#!/bin/bash\nif [[ "$1" == -v ]]; then exit 0; fi\nexport FAKE_ROOT=1\nexec "$@"\n')
         self.data = {'containers': [], 'images': {}, 'store': [], 'registry': {}, 'projects': {}, 'hashes': {}}
@@ -258,6 +254,20 @@ class DockerTests(unittest.TestCase):
         states = {c['Name']: (c['State']['Running'], c['Image']) for c in self.saved()['containers']}
         self.assertEqual(states, {'/api': (True, 'sha256:new-example/app:latest'),
             '/jobs': (False, 'sha256:new-example/jobs:1'), '/idle': (False, 'sha256:new-example/idle:1')})
+
+    def test_project_deployed_from_several_compose_files_is_updated_with_all_of_them_in_order(self):
+        self.setup_docker()
+        api = self.add_container('api')
+        base = self.compose_file('sample')
+        override = base.with_name('compose.oracle.yaml')
+        override.write_text('services: {}\n')
+        api['Config']['Labels']['com.docker.compose.project.config_files'] = f'{base},{override}'
+        status, output = self.update()
+        self.assertEqual(status, 0, output)
+        for call in self.operations('compose', 'sample'):
+            self.assertEqual([call[i + 1] for i, word in enumerate(call) if word == '--file'],
+                [str(base), str(override)], call)
+        self.assertIn('sample: 1 container recreated, 1 old image removed. Running: api.', output)
 
     def test_project_without_newer_images_or_edits_is_reported_up_to_date(self):
         self.setup_docker()
@@ -380,9 +390,9 @@ class DockerTests(unittest.TestCase):
                 self.assertFalse(self.mutations())
 
     def test_projects_that_cannot_be_reproduced_are_skipped_without_changes(self):
-        reasons = {'missing-file': 'file is unavailable', 'several-files': 'only single-file projects',
-            'env-file': 'only single-file projects', 'mixed-sources': 'different Compose files',
-            'unresolved': 'does not resolve'}
+        reasons = {'missing-file': 'file is unavailable', 'missing-override': 'file is unavailable',
+            'env-file': 'environment file', 'mixed-sources': 'different Compose files',
+            'unresolved': 'do not resolve'}
         for mode, reason in reasons.items():
             with self.subTest(mode=mode):
                 self.setup_docker()
@@ -393,9 +403,9 @@ class DockerTests(unittest.TestCase):
                 if mode == 'missing-file':
                     for container in (api, worker):
                         container['Config']['Labels']['com.docker.compose.project.config_files'] = '/missing/compose.yaml'
-                if mode == 'several-files':
+                if mode == 'missing-override':
                     for container in (api, worker):
-                        container['Config']['Labels']['com.docker.compose.project.config_files'] = compose + ',' + compose
+                        container['Config']['Labels']['com.docker.compose.project.config_files'] = compose + ',/missing/override.yaml'
                 if mode == 'env-file':
                     for container in (api, worker):
                         container['Config']['Labels']['com.docker.compose.project.environment_file'] = compose

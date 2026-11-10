@@ -1,12 +1,11 @@
 # shellcheck shell=bash disable=SC2034 # MODULE_TITLE and MODULE_ACTIONS are read by maint.
-# Docker: list local containers; update Compose projects from their current Compose file.
-# The unit of update is a Compose project deployed from one Compose file: everything an update recreates
-# or removes belongs to it.
+# Docker: list local containers; update Compose projects from their current Compose files.
+# The unit of update is a Compose project: everything an update recreates or removes belongs to it.
 
 MODULE_TITLE='Docker'
 MODULE_ACTIONS=(
     'list|List containers by Compose project; changes nothing'
-    'update|Pull newer images, apply the current Compose file, and remove the images it replaced'
+    'update|Pull newer images, apply the current Compose files, and remove the images they replaced'
 )
 
 # Settings.
@@ -57,7 +56,7 @@ action_update() {
         info 'No selected project can be updated.'
         return 0
     fi
-    warn_note 'Settings such as ports, users, and limits are applied exactly as written in the Compose file; changes made to containers by hand are not kept.'
+    warn_note 'Settings such as ports, users, and limits are applied exactly as written in the Compose files; changes made to containers by hand are not kept.'
     warn_note 'Services whose image or settings changed are recreated; containers of services no longer defined are removed.'
     warn_note "Services that were running are started again and must be running/healthy within ${DOCKER_WAIT_SECONDS} seconds; stopped services stay stopped unless a running service depends on them."
     warn_note 'Named volumes and bind mounts are kept. Recreation loses in-memory data, tmpfs contents, and files changed inside the container.'
@@ -98,19 +97,15 @@ docker_run() {
 
 # Pins the user's local Docker endpoint, then falls back to sudo only if that socket denies access.
 docker_connect() {
-    local context endpoint
+    local endpoint
     require_commands docker jq
     create_temp_dir
     DOCKER_INVENTORY="$TMP_DIR/containers.json"
     DOCKER_PROJECT="$TMP_DIR/project.json"
     DOCKER_USE_SUDO=0
-    # Resolve the endpoint before sudo, which has its own Docker context.
-    if [[ -z "${DOCKER_CONTEXT:-}" && -n "${DOCKER_HOST:-}" ]]; then
-        endpoint="$DOCKER_HOST"
-    else
-        context="${DOCKER_CONTEXT:-$(docker context show)}"
-        endpoint="$(docker context inspect "$context" | jq -er '.[0].Endpoints.docker.Host')"
-    fi
+    # Resolve the endpoint before sudo, which has its own Docker context. Without a name, the CLI inspects
+    # the context it would use itself, so DOCKER_HOST and DOCKER_CONTEXT keep their usual precedence.
+    endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
     if [[ "$endpoint" != unix:///* ]]; then
         error 'This module supports local Unix-socket Docker engines only; the selected endpoint was not changed.'
         return 1
@@ -244,10 +239,11 @@ docker_select_projects() {
     done
 }
 
-# Sets DOCKER_COMPOSE to the command that deployed the project: its name, directory, and Compose file
-# as recorded on its containers. Snapshots those containers to DOCKER_PROJECT.
+# Sets DOCKER_COMPOSE to the command that deployed the project: its name, directory, and Compose files
+# in their order, as recorded on its containers. Snapshots those containers to DOCKER_PROJECT.
 docker_compose_context() {
-    local project="$1" directory file environment_files
+    local project="$1" directory files environment_files file
+    local -a paths=()
     jq --arg project "$project" "$DOCKER_JQ"'map(select(compose("project") == $project))' \
         "$DOCKER_INVENTORY" > "$DOCKER_PROJECT"
     if ! jq -e "$DOCKER_JQ"'length > 0 and
@@ -257,26 +253,34 @@ docker_compose_context() {
         return 1
     fi
     directory="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.working_dir")' "$DOCKER_PROJECT")"
-    file="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.config_files")' "$DOCKER_PROJECT")"
+    files="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.config_files")' "$DOCKER_PROJECT")"
     environment_files="$(jq -r "$DOCKER_JQ"'.[0] | compose("project.environment_file")' "$DOCKER_PROJECT")"
-    if [[ "$file" == *,* || -n "$environment_files" ]]; then
-        warn_condition "Skipping ${project}: it was deployed with several Compose files or an environment file; only single-file projects are updated."
+    if [[ -n "$environment_files" ]]; then
+        warn_condition "Skipping ${project}: it was deployed with an environment file, which this module does not reproduce."
         return 1
     fi
-    if [[ "$directory" != /* || ! -d "$directory" || "$file" != /* || ! -r "$file" || "$directory$file" == *$'\n'* ]]; then
-        warn_condition "Skipping ${project}: its recorded Compose directory or file is unavailable: ${directory}, ${file}"
+    if [[ "$directory" != /* || ! -d "$directory" || -z "$files" || "$directory$files" == *$'\n'* ]]; then
+        warn_condition "Skipping ${project}: its recorded Compose directory or files are unavailable: ${directory}, ${files}"
         return 1
     fi
-    DOCKER_COMPOSE=(compose --project-name "$project" --project-directory "$directory" --file "$file")
+    DOCKER_COMPOSE=(compose --project-name "$project" --project-directory "$directory")
+    IFS=, read -r -a paths <<< "$files"
+    for file in "${paths[@]}"; do
+        if [[ "$file" != /* || ! -r "$file" ]]; then
+            warn_condition "Skipping ${project}: its recorded Compose file is unavailable: ${file}"
+            return 1
+        fi
+        DOCKER_COMPOSE+=(--file "$file")
+    done
 }
 
-# Confirms the project's Compose file still resolves, and shows any Compose warnings before the prompt.
+# Confirms the project's Compose files still resolve, and shows any Compose warnings before the prompt.
 docker_check_project() {
     local project="$1" messages="$TMP_DIR/compose-check"
     docker_compose_context "$project" || return 1
     if ! docker_exec "${DOCKER_COMPOSE[@]}" config --quiet > "$messages" 2>&1; then
         tee -a "$LOG_FILE" < "$messages"
-        warn_condition "Skipping ${project}: its Compose file does not resolve; see the messages above."
+        warn_condition "Skipping ${project}: its Compose files do not resolve; see the messages above."
         return 1
     fi
     if [[ -s "$messages" ]]; then
@@ -299,9 +303,9 @@ docker_show_changes() {
         ([$deployed[] | compose("service") as $service |
             select($model[$service] != null and $model[$service] != compose("config-hash")) | $service] | unique) as $changed |
         ([$deployed[] | compose("service") | select($model[.] == null)] | unique) as $removed |
-        (select($changed != []) | "settings in the Compose file differ from the current containers for: " +
-            ($changed | join(", ")) + ". Expected after editing the file or upgrading Compose; otherwise decline and check for unset variables."),
-        (select($removed != []) | "no longer defined in the Compose file; their containers will be removed: " +
+        (select($changed != []) | "settings in the Compose files differ from the current containers for: " +
+            ($changed | join(", ")) + ". Expected after editing the files or upgrading Compose; otherwise decline and check for unset variables."),
+        (select($removed != []) | "no longer defined in the Compose files; their containers will be removed: " +
             ($removed | join(", ")))')"
     [[ -n "$notes" ]] || return 0
     mapfile -t lines <<< "$notes"
@@ -316,11 +320,11 @@ docker_update_project() {
     local project="$1" defined services
     local -a running=()
     DOCKER_CHANGES=()
-    info "${project}: applying its Compose file..."
+    info "${project}: applying its Compose files..."
     # Read the state after the downloads, not at selection time: it may have changed meanwhile.
     docker_load_inventory
     docker_compose_context "$project" || return 0
-    # A running service that the Compose file no longer defines is removed, not started again.
+    # A running service that the Compose files no longer define is removed, not started again.
     defined="$(docker_exec "${DOCKER_COMPOSE[@]}" config --services 2> /dev/null)"
     services="$(jq -r --arg defined "$defined" "$DOCKER_JQ"'[.[] | select(.State.Running) |
         compose("service") | select(IN($defined | split("\n")[]))] | unique[]' "$DOCKER_PROJECT")"

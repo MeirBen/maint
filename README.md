@@ -89,23 +89,23 @@ Each action runs in its own process, `lib/run.sh`, with only `lib/common.sh` and
 | --- | --- |
 | `maint docker` | Open the Docker menu |
 | `maint docker list` | List every container, running or stopped, by Compose project; changes nothing |
-| `maint docker update` | Pull newer images, apply the current Compose file, and remove the images it replaced |
+| `maint docker update` | Pull newer images, apply the current Compose files, and remove the images they replaced |
 
-- **Unit of work:** a Compose project deployed from one Compose file, as with `docker compose -p NAME -f compose.yaml up`. `update` changes or removes only what the selected projects own: their containers and the images those containers ran. Containers created outside Compose are listed but never updated.
-- **Discovery:** reads the local Docker engine on each run; nothing about your containers is configured in the module. Each project is updated with the project name, working directory, and Compose file recorded on its containers. A project deployed with several Compose files or an environment file, or whose file is missing or no longer resolves, is reported and skipped. Requires the Docker CLI with Compose v2 and `jq`. Remote endpoints are rejected rather than replaced with the local daemon.
+- **Unit of work:** a Compose project deployed from one or more Compose files, as with `docker compose -p NAME -f compose.yaml [-f override.yaml] up`. `update` changes or removes only what the selected projects own: their containers and the images those containers ran. Containers created outside Compose are listed but never updated.
+- **Discovery:** reads the local Docker engine on each run; nothing about your containers is configured in the module. Each project is updated with the project name, working directory, and Compose files, in order, recorded on its containers. A project deployed with an environment file, or whose files are missing or no longer resolve, is reported and skipped. Requires the Docker CLI with Compose v2 and `jq`. Uses the engine the `docker` command itself selects; a remote endpoint is rejected rather than replaced with the local daemon.
 - **Selection:** in a terminal, choose `all` or project numbers separated by spaces/commas; Enter or `0` cancels. Without a terminal, every project is checked, but the confirmation answers No and nothing changes.
 - **Update, in order:** check every selected project, show what will happen, and ask once. Services whose settings differ from their running containers, and services no longer defined, are named before the question. Then pull every project's images, all before the first change, so a registry failure leaves every project untouched. Then, one project at a time:
   1. Re-read the project's containers.
-  2. Bring every service in line with the current Compose file without starting anything: Compose recreates containers whose image or settings changed and removes containers of services no longer defined.
+  2. Bring every service in line with the current Compose files without starting anything: Compose recreates containers whose image or settings changed and removes containers of services no longer defined.
   3. Start the services that were running before and wait until they are running/healthy. Stopped services stay stopped unless a running service depends on them.
   4. Remove the images the project ran before once no container uses them and every remaining tag on them is one the project used. Anything still in use, or an image another tag refers to, is kept.
   5. Report the result in one line, for example `ca-shared-redis: 1 container recreated, 1 old image removed. Running: redis.` or `ca-shared-redis: already up to date, nothing changed. Running: redis.`
-- **Container settings:** ports, users, limits, secrets, and every other setting are applied exactly as written in the Compose file, so they survive every update. Changes made to a container by hand (`docker update`, edits inside it) are not kept; record them in the Compose file. Services whose settings would change are named before the question. That is expected after you edit the file or upgrade Compose; otherwise, for example when a variable is unset, decline and fix the cause.
+- **Container settings:** ports, users, limits, secrets, and every other setting are applied exactly as written in the Compose files, so they survive every update. Changes made to a container by hand (`docker update`, edits inside it) are not kept; record them in the Compose files. Settings changes named before the question are expected after you edit the files or upgrade Compose; otherwise, for example when a variable is unset, decline and fix the cause.
 - **Upgrades:** a floating tag such as `redis:alpine` is updated whenever the registry has a newer image. A digest-pinned image such as `name:tag@sha256:…` changes only when you edit the pin; then run `update`, and the image it replaced is removed.
 - **Data:** named volumes and bind mounts are never removed, so application data such as databases and saved connections is kept. Recreation loses in-memory data, tmpfs contents, and changes made inside the container filesystem; stop a service's consumers first when they depend on that state. A failure stops the action; projects already updated stay updated.
 - **Settings and logs:** `DOCKER_WAIT_SECONDS` sets the health wait (120 seconds). The runtime supplies locking, sudo, temporary-file cleanup, and `logs/docker.log`. The module lock coordinates `maint` runs only, not other Docker clients.
 
-Both actions appear automatically in the main menu, help, and Tab completion; reinstalling is unnecessary. Docker Engine itself remains part of `maint sys update` through APT.
+Docker Engine itself remains part of `maint sys update` through APT.
 
 ## Front ends
 
